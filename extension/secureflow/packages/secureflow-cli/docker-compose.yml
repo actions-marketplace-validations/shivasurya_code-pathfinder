@@ -1,0 +1,32 @@
+services:
+  secureflow-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: secureflow-plugin-analyzer
+    environment:
+      - MAX_PLUGINS=50
+      - NODE_ENV=production
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    # Use host network to access localhost services directly
+    network_mode: host
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits for safety
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    # Restart policy
+    restart: unless-stopped
+
+volumes:
+  secureflow-settings:
+    driver: local

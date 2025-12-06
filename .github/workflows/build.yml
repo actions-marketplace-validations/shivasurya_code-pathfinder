@@ -6,35 +6,59 @@ on:
       - main
       - master
   pull_request:
+    paths:
+      - 'sast-engine/**'
+      - 'playground/**'
+      - 'pathfinder-rules/**'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.22.0'
+          go-version: '1.25.3'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
 
       - name: Check out code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Install codepathfinder Python package
+        run: pip install codepathfinder==1.0.0
 
       - name: Get dependencies
         run: |
-          cd sourcecode-parser
+          cd sast-engine
           go mod download
-
-      - name: Build
-        run: |
-          cd sourcecode-parser
-          go build -o pathfinder
 
       - name: Test
         run: |
-          cd sourcecode-parser
-          go test -v ./... -coverprofile=coverage.out -covermode=atomic
+          cd sast-engine
+          go test -p 2 -v ./... -coverprofile=coverage.out -covermode=atomic
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sast-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          working-directory: sast-engine

@@ -1,0 +1,19 @@
+# Build outputs
+build/
+*.class
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+
+# Gradle
+.gradle/
+
+# Generated registries (local testing only)
+# Note: Production registries are in docs/public/assets/registries/ (committed for CDN hosting)
+registries/
+*.test
