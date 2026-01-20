@@ -50,6 +50,14 @@ Examples:
 		}
 		logger := output.NewLogger(verbosity)
 
+		// Display banner if appropriate
+		noBanner, _ := cmd.Flags().GetBool("no-banner")
+		if output.ShouldShowBanner(logger.IsTTY(), noBanner) {
+			output.PrintBanner(logger.GetWriter(), Version, output.DefaultBannerOptions())
+		} else if logger.IsTTY() && !noBanner {
+			fmt.Fprintln(logger.GetWriter(), output.GetCompactBanner(Version))
+		}
+
 		// Parse and validate --fail-on severities
 		failOn := output.ParseFailOn(failOnStr)
 		if len(failOn) > 0 {
@@ -71,16 +79,24 @@ Examples:
 		}
 
 		// Build code graph (AST)
-		logger.Progress("Building code graph from %s...", projectPath)
-		codeGraph := graph.Initialize(projectPath)
+		codeGraph := graph.Initialize(projectPath, &graph.ProgressCallbacks{
+			OnStart: func(totalFiles int) {
+				logger.StartProgress("Building code graph", totalFiles)
+			},
+			OnProgress: func() {
+				logger.UpdateProgress(1)
+			},
+		})
+		logger.FinishProgress()
 		if len(codeGraph.Nodes) == 0 {
 			return fmt.Errorf("no source files found in project")
 		}
 		logger.Statistic("Code graph built: %d nodes", len(codeGraph.Nodes))
 
 		// Build module registry
-		logger.Progress("Building module registry...")
+		logger.StartProgress("Building module registry", -1)
 		moduleRegistry, err := registry.BuildModuleRegistry(projectPath, skipTests)
+		logger.FinishProgress()
 		if err != nil {
 			logger.Warning("failed to build module registry: %v", err)
 			moduleRegistry = core.NewModuleRegistry()
@@ -90,8 +106,9 @@ Examples:
 		}
 
 		// Build callgraph
-		logger.Progress("Building callgraph...")
+		logger.StartProgress("Building callgraph", -1)
 		cg, err := builder.BuildCallGraph(codeGraph, moduleRegistry, projectPath, logger)
+		logger.FinishProgress()
 		if err != nil {
 			return fmt.Errorf("failed to build callgraph: %w", err)
 		}
@@ -99,9 +116,10 @@ Examples:
 			len(cg.Functions), countTotalCallSites(cg))
 
 		// Load Python DSL rules
-		logger.Progress("Loading rules from %s...", rulesPath)
+		logger.StartProgress("Loading rules", -1)
 		loader := dsl.NewRuleLoader(rulesPath)
 		rules, err := loader.LoadRules(logger)
+		logger.FinishProgress()
 		if err != nil {
 			return fmt.Errorf("failed to load rules: %w", err)
 		}
@@ -122,6 +140,7 @@ Examples:
 		var scanErrors []string
 		hadErrors := false
 
+		logger.StartProgress("Executing rules", len(rules))
 		for _, rule := range rules {
 			detections, err := loader.ExecuteRule(&rule, cg)
 			if err != nil {
@@ -129,6 +148,7 @@ Examples:
 				logger.Warning("%s", errMsg)
 				scanErrors = append(scanErrors, errMsg)
 				hadErrors = true
+				logger.UpdateProgress(1)
 				continue
 			}
 
@@ -137,7 +157,9 @@ Examples:
 				enriched, _ := enricher.EnrichAll(detections, rule)
 				allEnriched = append(allEnriched, enriched...)
 			}
+			logger.UpdateProgress(1)
 		}
+		logger.FinishProgress()
 
 		logger.Statistic("Scan complete. Found %d vulnerabilities", len(allEnriched))
 		logger.Progress("Generating %s output...", outputFormat)
@@ -194,8 +216,8 @@ func init() {
 	ciCmd.Flags().StringP("rules", "r", "", "Path to Python DSL rules file or directory (required)")
 	ciCmd.Flags().StringP("project", "p", "", "Path to project directory to scan (required)")
 	ciCmd.Flags().StringP("output", "o", "sarif", "Output format: sarif or json (default: sarif)")
-	ciCmd.Flags().BoolP("verbose", "v", false, "Show progress and statistics")
-	ciCmd.Flags().Bool("debug", false, "Show debug diagnostics with timestamps")
+	ciCmd.Flags().BoolP("verbose", "v", false, "Show statistics and timing information")
+	ciCmd.Flags().Bool("debug", false, "Show detailed debug diagnostics with file-level progress and timestamps")
 	ciCmd.Flags().String("fail-on", "", "Fail with exit code 1 if findings match severities (e.g., critical,high)")
 	ciCmd.Flags().Bool("skip-tests", true, "Skip test files (test_*.py, *_test.py, conftest.py, etc.)")
 	ciCmd.MarkFlagRequired("rules")
