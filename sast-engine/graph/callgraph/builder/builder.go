@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -138,6 +139,12 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 		logger.Statistic("Loaded stdlib manifest from CDN: %d modules available", remoteLoader.ModuleCount())
 	}
 
+	// Phase 1: Build class context map for class-qualified FQN generation
+	// This maps file locations to class names, allowing us to determine
+	// which class a method belongs to based on its byte range.
+	// We build this once and reuse it throughout call graph construction.
+	classContext := buildClassContext(codeGraph)
+
 	// First, index all function definitions from the code graph
 	// This builds the Functions map for quick lookup
 	indexFunctions(codeGraph, callGraph, registry)
@@ -170,7 +177,16 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 					continue
 				}
 
-				returns, err := resolution.ExtractReturnTypes(job.filePath, sourceCode, job.modulePath, typeEngine.Builtins)
+				// Extract imports using cache (needed for class instantiation resolution)
+				importMap, err := importCache.GetOrExtract(job.filePath, sourceCode, registry)
+				if err != nil {
+					continue
+				}
+
+				// Store ImportMap for later use in attribute placeholder resolution (P0 fix)
+				typeEngine.AddImportMap(job.filePath, importMap)
+
+				returns, err := resolution.ExtractReturnTypes(job.filePath, sourceCode, job.modulePath, typeEngine.Builtins, importMap)
 				if err != nil {
 					continue
 				}
@@ -224,8 +240,18 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 					continue
 				}
 
+				// Extract imports using cache (needed for class instantiation resolution)
+				importMap, err := importCache.GetOrExtract(filePath, sourceCode, registry)
+				if err != nil {
+					continue
+				}
+
+				// Store ImportMap for later use in attribute placeholder resolution (P0 fix)
+				typeEngine.AddImportMap(filePath, importMap)
+
 				// Extract variable assignments - typeEngine methods are mutex-protected internally
-				_ = extraction.ExtractVariableAssignments(filePath, sourceCode, typeEngine, registry, typeEngine.Builtins)
+				// Class context is tracked during AST traversal to build class-qualified FQNs (matching Pass 1)
+				_ = extraction.ExtractVariableAssignments(filePath, sourceCode, typeEngine, registry, typeEngine.Builtins, importMap)
 
 				// Progress tracking
 				count := varProcessed.Add(1)
@@ -323,6 +349,9 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 					continue
 				}
 
+				// Store ImportMap for later use in attribute placeholder resolution (P0 fix)
+				typeEngine.AddImportMap(job.filePath, importMap)
+
 				// Extract all call sites from this file
 				callSites, err := resolution.ExtractCallSites(job.filePath, sourceCode, importMap)
 				if err != nil {
@@ -334,8 +363,9 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 
 				// Process each call site to resolve targets and build edges
 				for _, callSite := range callSites {
-					// Find the caller function containing this call site
-					callerFQN := findContainingFunction(callSite.Location, fileFunctions, job.modulePath)
+					// Phase 1: Find the caller function containing this call site
+					// Now with class context for class-qualified FQNs
+					callerFQN := findContainingFunction(callSite.Location, fileFunctions, job.modulePath, classContext)
 					if callerFQN == "" {
 						callerFQN = job.modulePath
 					}
@@ -398,6 +428,9 @@ func BuildCallGraph(codeGraph *graph.CodeGraph, registry *core.ModuleRegistry, p
 	GenerateTaintSummaries(callGraph, codeGraph, registry)
 	logger.Statistic("Generated taint summaries for %d functions", len(callGraph.Summaries))
 
+	// Store attribute registry for symbol search and type inference
+	callGraph.Attributes = typeEngine.Attributes
+
 	return callGraph, nil
 }
 
@@ -414,9 +447,16 @@ func IndexFunctions(codeGraph *graph.CodeGraph, callGraph *core.CallGraph, regis
 
 // indexFunctions is the internal implementation of IndexFunctions.
 func indexFunctions(codeGraph *graph.CodeGraph, callGraph *core.CallGraph, registry *core.ModuleRegistry) {
+	// First pass: Build class context map (file+line → class name)
+	classContext := buildClassContext(codeGraph)
+
 	for _, node := range codeGraph.Nodes {
-		// Only index function/method definitions
-		if node.Type != "method_declaration" && node.Type != "function_definition" {
+		// Only index function/method definitions (Java and Python types)
+		// Java: method_declaration
+		// Python: function_definition, method, constructor, property, special_method
+		if node.Type != "method_declaration" && node.Type != "function_definition" &&
+			node.Type != "method" && node.Type != "constructor" &&
+			node.Type != "property" && node.Type != "special_method" {
 			continue
 		}
 
@@ -426,10 +466,92 @@ func indexFunctions(codeGraph *graph.CodeGraph, callGraph *core.CallGraph, regis
 			continue
 		}
 
-		// Build fully qualified name: module.function
-		fqn := modulePath + "." + node.Name
+		// Build fully qualified name with class context if applicable
+		fqn := buildFQN(modulePath, node, classContext)
 		callGraph.Functions[fqn] = node
 	}
+}
+
+// buildClassContext creates a map of file locations to class names.
+// This allows us to determine which class a method belongs to based on its location.
+func buildClassContext(codeGraph *graph.CodeGraph) map[string]string {
+	classCtx := make(map[string]string)
+
+	// Find all class definitions
+	for _, node := range codeGraph.Nodes {
+		if node.Type == "class_definition" || node.Type == "interface" ||
+			node.Type == "enum" || node.Type == "dataclass" {
+			// For each class, we need to know its byte range
+			// Methods/constructors within this range belong to this class
+			if node.SourceLocation != nil {
+				// Store class name by file + start/end bytes
+				key := fmt.Sprintf("%s:%d:%d", node.File, node.SourceLocation.StartByte, node.SourceLocation.EndByte)
+				classCtx[key] = node.Name
+			}
+		}
+	}
+
+	return classCtx
+}
+
+// buildFQN constructs the fully qualified name for a function/method node.
+// For methods: module.ClassName.methodName
+// For functions: module.functionName.
+func buildFQN(modulePath string, node *graph.Node, classContext map[string]string) string {
+	// For methods/constructors/properties, try to find the containing class
+	if node.Type == "method" || node.Type == "constructor" ||
+		node.Type == "property" || node.Type == "special_method" {
+		// Find which class this method belongs to
+		className := findContainingClass(node, classContext)
+		if className != "" {
+			return fmt.Sprintf("%s.%s.%s", modulePath, className, node.Name)
+		}
+	}
+
+	// For top-level functions or if class not found, use simple FQN
+	return modulePath + "." + node.Name
+}
+
+// findContainingClass determines which class a node belongs to based on its location.
+func findContainingClass(node *graph.Node, classContext map[string]string) string {
+	if node.SourceLocation == nil {
+		return ""
+	}
+
+	// Check if this node is within any class's byte range
+	for key, className := range classContext {
+		// Parse key format: "/path/to/file.py:startByte:endByte"
+		// Use strings.LastIndex to find the last two colons (for byte ranges)
+		lastColon := strings.LastIndex(key, ":")
+		if lastColon == -1 {
+			continue
+		}
+		secondLastColon := strings.LastIndex(key[:lastColon], ":")
+		if secondLastColon == -1 {
+			continue
+		}
+
+		// Extract components
+		file := key[:secondLastColon]
+		classStartStr := key[secondLastColon+1 : lastColon]
+		classEndStr := key[lastColon+1:]
+
+		// Parse byte positions
+		classStart, err1 := strconv.ParseUint(classStartStr, 10, 32)
+		classEnd, err2 := strconv.ParseUint(classEndStr, 10, 32)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+
+		// Check if node is within this class's byte range
+		if file == node.File &&
+			node.SourceLocation.StartByte >= uint32(classStart) &&
+			node.SourceLocation.EndByte <= uint32(classEnd) {
+			return className
+		}
+	}
+
+	return ""
 }
 
 // GetFunctionsInFile returns all function definitions in a specific file.
@@ -450,7 +572,9 @@ func getFunctionsInFile(codeGraph *graph.CodeGraph, filePath string) []*graph.No
 
 	for _, node := range codeGraph.Nodes {
 		if node.File == filePath &&
-			(node.Type == "method_declaration" || node.Type == "function_definition") {
+			(node.Type == "method_declaration" || node.Type == "function_definition" ||
+				node.Type == "method" || node.Type == "constructor" ||
+				node.Type == "property" || node.Type == "special_method") {
 			functions = append(functions, node)
 		}
 	}
@@ -464,21 +588,27 @@ func getFunctionsInFile(codeGraph *graph.CodeGraph, filePath string) []*graph.No
 // Algorithm:
 //  1. Iterate through all functions in the file
 //  2. Find function with the highest line number that's still <= call line
-//  3. Return the FQN of that function
+//  3. Return the FQN of that function (class-qualified for methods)
 //
 // Parameters:
 //   - location: source location of the call site
 //   - functions: all function definitions in the file
 //   - modulePath: module path of the file
+//   - classContext: map of file locations to class names (for class-qualified FQNs)
 //
 // Returns:
 //   - Fully qualified name of the containing function, or empty if not found
-func FindContainingFunction(location core.Location, functions []*graph.Node, modulePath string) string {
-	return findContainingFunction(location, functions, modulePath)
+//
+// Examples:
+//   - Module-level function: "myapp.process"
+//   - Instance method: "myapp.User.save"
+//   - Nested class method: "myapp.Outer.Inner.method"
+func FindContainingFunction(location core.Location, functions []*graph.Node, modulePath string, classContext map[string]string) string {
+	return findContainingFunction(location, functions, modulePath, classContext)
 }
 
 // findContainingFunction is the internal implementation of FindContainingFunction.
-func findContainingFunction(location core.Location, functions []*graph.Node, modulePath string) string {
+func findContainingFunction(location core.Location, functions []*graph.Node, modulePath string, classContext map[string]string) string {
 	// In Python, module-level code has no indentation (column == 1)
 	// If the call site is at column 1, it's module-level, not inside any function
 	if location.Column == 1 {
@@ -500,6 +630,17 @@ func findContainingFunction(location core.Location, functions []*graph.Node, mod
 	}
 
 	if bestMatch != nil {
+		// Phase 1: Build class-qualified FQN for methods
+		// For methods/constructors/properties/special_methods, include class name
+		if bestMatch.Type == "method" || bestMatch.Type == "constructor" ||
+			bestMatch.Type == "property" || bestMatch.Type == "special_method" {
+			className := findContainingClass(bestMatch, classContext)
+			if className != "" {
+				return fmt.Sprintf("%s.%s.%s", modulePath, className, bestMatch.Name)
+			}
+		}
+
+		// For module-level functions or if class not found
 		return modulePath + "." + bestMatch.Name
 	}
 
@@ -689,15 +830,112 @@ func resolveCallTarget(target string, importMap *core.ImportMap, registry *core.
 		// Attribute resolution attempted but failed - fall through
 	}
 
-	// Handle self.method() calls - resolve to current module
+	// Phase 3: Handle super().method() calls - resolve to parent class method
+	if strings.HasPrefix(target, "super().") {
+		methodName := strings.TrimPrefix(target, "super().")
+
+		// Extract current class name from callerFQN
+		// callerFQN format: "module.ClassName.methodName"
+		parts := strings.Split(callerFQN, ".")
+
+		if len(parts) >= 3 {
+			// Current class info
+			className := parts[len(parts)-2]
+			currentClassFQN := currentModule + "." + className
+
+			// Phase 3: Search for parent class in codeGraph
+			// Strategy: Look for class nodes and check their relationships
+			var parentClassFQN string
+
+			if codeGraph != nil {
+				// Find the current class node
+				for _, node := range codeGraph.Nodes {
+					if node.Type == "class_definition" && node.File != "" {
+						// Build FQN for this class node
+						modulePath, ok := registry.FileToModule[node.File]
+						if ok {
+							nodeFQN := modulePath + "." + node.Name
+							if nodeFQN == currentClassFQN {
+								// Found current class node - check for parent info
+								// In Python parser, class inheritance might be stored in node metadata
+								// For now, try to find parent class by searching for classes in same module
+								// This is a heuristic approach for Phase 3
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// Heuristic fallback: Try common parent class names
+			// Look for Base*, Parent*, or classes ending with "Base"
+			if parentClassFQN == "" && callGraph != nil {
+				// Search Functions map for potential parent class methods
+				parentMethodFQN := currentModule + "." + className + "Base." + methodName
+				if callGraph.Functions[parentMethodFQN] != nil {
+					return parentMethodFQN, true, nil
+				}
+			}
+
+			// If we can't find explicit parent, try resolving without class qualification
+			// This handles cases where super() calls might resolve to module-level functions
+			moduleFQN := currentModule + "." + methodName
+			if callGraph != nil && callGraph.Functions[moduleFQN] != nil {
+				return moduleFQN, true, nil
+			}
+
+			// Return unresolved with descriptive FQN
+			return currentModule + ".super()." + methodName, false, nil
+		}
+
+		// Can't extract class from callerFQN
+		return "super()." + methodName, false, nil
+	}
+
+	// Phase 2: Handle self.method() calls - resolve to current class method
 	if strings.HasPrefix(target, "self.") {
 		methodName := strings.TrimPrefix(target, "self.")
-		// Resolve to module.method
+
+		// Phase 2: Extract class name from callerFQN for class-qualified lookup
+		// callerFQN format: "module.ClassName.methodName" for methods
+		//                   "module.functionName" for module-level functions
+		parts := strings.Split(callerFQN, ".")
+
+		// If callerFQN has 3+ parts, it's a class method
+		// parts = ["module", "ClassName", "methodName"] or more for nested modules
+		if len(parts) >= 3 {
+			// Extract class name (second-to-last part)
+			// For "module.ClassName.methodName" → className = "ClassName"
+			// For "app.models.User.save" → className = "User"
+			className := parts[len(parts)-2]
+
+			// Build class-qualified FQN: module.ClassName.methodName
+			classQualifiedFQN := currentModule + "." + className + "." + methodName
+
+			// Try class-qualified lookup first
+			if validateFQN(classQualifiedFQN, registry) {
+				return classQualifiedFQN, true, nil
+			}
+
+			// Check if target exists in Functions map (more reliable than validateFQN)
+			if callGraph != nil && callGraph.Functions[classQualifiedFQN] != nil {
+				return classQualifiedFQN, true, nil
+			}
+		}
+
+		// Fall back to module-level method (backward compatibility)
+		// This handles cases where method might be at module level or
+		// when class extraction fails
 		moduleFQN := currentModule + "." + methodName
-		// Validate exists
 		if validateFQN(moduleFQN, registry) {
 			return moduleFQN, true, nil
 		}
+
+		// Check Functions map for module-level
+		if callGraph != nil && callGraph.Functions[moduleFQN] != nil {
+			return moduleFQN, true, nil
+		}
+
 		// Return unresolved but with module prefix
 		return moduleFQN, false, nil
 	}
@@ -778,10 +1016,24 @@ func resolveCallTarget(target string, importMap *core.ImportMap, registry *core.
 						}
 					}
 
+					// Phase 3: Enhanced instance.method() resolution
 					// Check if it's a project type (user-defined class/method)
 					methodFQN := typeFQN + "." + rest
 
-					// Validate method exists in code graph
+					// Phase 3: Try Functions map first with class-qualified FQN
+					// This is more reliable than codeGraph.Nodes for class methods
+					if callGraph != nil {
+						if node := callGraph.Functions[methodFQN]; node != nil {
+							// Found in Functions map with class-qualified FQN
+							if node.Type == "method" || node.Type == "function_definition" ||
+								node.Type == "constructor" || node.Type == "property" ||
+								node.Type == "special_method" {
+								return methodFQN, true, binding.Type
+							}
+						}
+					}
+
+					// Validate method exists in code graph (fallback)
 					if codeGraph != nil {
 						if node, ok := codeGraph.Nodes[methodFQN]; ok {
 							if node.Type == "method_declaration" || node.Type == "function_definition" {
@@ -790,8 +1042,9 @@ func resolveCallTarget(target string, importMap *core.ImportMap, registry *core.
 							}
 						}
 
-						// Python class methods are stored at module level (e.g., test.save, not test.User.save)
+						// Legacy: Python class methods stored at module level
 						// Try stripping the class name and looking for module.method
+						// This is for backward compatibility with older indexing
 						lastDot := strings.LastIndex(typeFQN, ".")
 						if lastDot >= 0 {
 							modulePart := typeFQN[:lastDot]
@@ -990,13 +1243,24 @@ func validateFQN(fqn string, registry *core.ModuleRegistry) bool {
 		return true
 	}
 
-	// Check if parent module exists (for functions)
+	// Check if parent module exists (for module-level functions/classes)
 	// "myapp.utils.sanitize" → check if "myapp.utils" exists
 	lastDot := strings.LastIndex(fqn, ".")
 	if lastDot > 0 {
 		parentModule := fqn[:lastDot]
 		if _, ok := registry.Modules[parentModule]; ok {
 			return true
+		}
+
+		// For class methods (module.ClassName.method_name), parent is ClassName
+		// which won't be in registry. Check grandparent (module level).
+		// "adapter.UserAdapter.to_domain_model" → check if "adapter" exists
+		secondLastDot := strings.LastIndex(parentModule, ".")
+		if secondLastDot > 0 {
+			grandparentModule := parentModule[:secondLastDot]
+			if _, ok := registry.Modules[grandparentModule]; ok {
+				return true
+			}
 		}
 	}
 

@@ -19,8 +19,10 @@ type TypeInferenceEngine struct {
 	Attributes     *registry.AttributeRegistry  // Class attributes registry (Phase 3 Task 12)
 	StdlibRegistry *core.StdlibRegistry         // Python stdlib registry (PR #2)
 	StdlibRemote   interface{}                  // Remote loader for lazy module loading (PR #3)
+	ImportMaps     map[string]*core.ImportMap   // File path -> ImportMap (P0 fix: for attribute placeholder resolution)
 	scopeMutex     sync.RWMutex                 // Protects Scopes map for concurrent access
 	typeMutex      sync.RWMutex                 // Protects ReturnTypes map for concurrent access
+	importMutex    sync.RWMutex                 // Protects ImportMaps for concurrent access
 }
 
 // StdlibRegistryRemote will be defined in registry package.
@@ -39,6 +41,7 @@ func NewTypeInferenceEngine(registry *core.ModuleRegistry) *TypeInferenceEngine 
 	return &TypeInferenceEngine{
 		Scopes:      make(map[string]*FunctionScope),
 		ReturnTypes: make(map[string]*core.TypeInfo),
+		ImportMaps:  make(map[string]*core.ImportMap),
 		Registry:    registry,
 	}
 }
@@ -68,6 +71,34 @@ func (te *TypeInferenceEngine) AddScope(scope *FunctionScope) {
 		defer te.scopeMutex.Unlock()
 		te.Scopes[scope.FunctionFQN] = scope
 	}
+}
+
+// AddImportMap stores an ImportMap for a file.
+// Thread-safe for concurrent writes.
+//
+// Parameters:
+//   - filePath: absolute path to the file
+//   - importMap: the ImportMap for that file
+func (te *TypeInferenceEngine) AddImportMap(filePath string, importMap *core.ImportMap) {
+	if importMap != nil && filePath != "" {
+		te.importMutex.Lock()
+		defer te.importMutex.Unlock()
+		te.ImportMaps[filePath] = importMap
+	}
+}
+
+// GetImportMap retrieves an ImportMap for a file.
+// Thread-safe for concurrent reads.
+//
+// Parameters:
+//   - filePath: absolute path to the file
+//
+// Returns:
+//   - ImportMap if found, nil otherwise
+func (te *TypeInferenceEngine) GetImportMap(filePath string) *core.ImportMap {
+	te.importMutex.RLock()
+	defer te.importMutex.RUnlock()
+	return te.ImportMaps[filePath]
 }
 
 // GetReturnType retrieves a function's return type.
@@ -132,11 +163,31 @@ func (te *TypeInferenceEngine) UpdateVariableBindingsWithFunctionReturns() {
 				// Build FQN for the function call
 				var funcFQN string
 
-				// Check if funcName already contains dots (e.g., "logging.getLogger", "MySerializer")
+				// Check if funcName contains dots (could be module.function OR receiver.method)
 				if strings.Contains(funcName, ".") {
-					// Already qualified (e.g., imported module.function)
-					// Try as-is first
-					funcFQN = funcName
+					// Split to check if it's an instance method call (receiver.method)
+					// vs. a module function call (module.function)
+					parts := strings.SplitN(funcName, ".", 2)
+					receiver := parts[0]
+					methodName := parts[1]
+
+					// Check if receiver is a variable in current scope (instance method)
+					if receiverBinding, exists := scope.Variables[receiver]; exists {
+						// This is an instance method call: obj.method()
+						if receiverBinding.Type != nil && !strings.HasPrefix(receiverBinding.Type.TypeFQN, "call:") {
+							// Receiver has a concrete type - build class-qualified FQN
+							// Example: receiver="manager" with type="main.UserManager", method="create_user"
+							// Result: "main.UserManager.create_user"
+							funcFQN = receiverBinding.Type.TypeFQN + "." + methodName
+						} else {
+							// Receiver type is unresolved placeholder - skip for now
+							// This variable will be resolved in a future iteration
+							continue
+						}
+					} else {
+						// Not a variable - assume it's a module path (e.g., "logging.getLogger")
+						funcFQN = funcName
+					}
 				} else {
 					// Simple name - need to qualify with current scope
 					lastDotIndex := strings.LastIndex(scope.FunctionFQN, ".")

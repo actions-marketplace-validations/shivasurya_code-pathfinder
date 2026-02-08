@@ -947,7 +947,7 @@ func TestResolveClassName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			moduleRegistry, codeGraph := tt.setupFunc()
-			result := resolveClassName(tt.className, tt.contextClassFQN, moduleRegistry, codeGraph)
+			result := resolveClassName(tt.className, tt.contextClassFQN, moduleRegistry, codeGraph, "", nil)
 			assert.Equal(t, tt.expectedFQN, result)
 		})
 	}
@@ -1084,6 +1084,267 @@ func TestFailureStats_SampleLimit(t *testing.T) {
 	assert.Equal(t, 20, len(attributeFailureStats.DeepChainSamples))
 	assert.Equal(t, 30, attributeFailureStats.TotalAttempts)
 	assert.Equal(t, 30, attributeFailureStats.DeepChains)
+}
+
+// TestResolveSelfAttributeCall_CustomClass tests P0 bug fix: resolving method calls
+// on instance variables of custom (user-defined) classes.
+//
+// Scenario:
+//
+//	class Service:
+//	    def __init__(self):
+//	        self.controller = Controller()  # controller is instance variable
+//
+//	    def process_action(self, name):
+//	        return self.controller.execute(name)  # call on instance variable
+//
+// Expected: self.controller.execute should resolve to controller.Controller.execute.
+func TestResolveSelfAttributeCall_CustomClass(t *testing.T) {
+	// Reset failure stats
+	attributeFailureStats = &FailureStats{
+		DeepChainSamples:         make([]string, 0, 20),
+		AttributeNotFoundSamples: make([]string, 0, 20),
+		CustomClassSamples:       make([]string, 0, 20),
+	}
+
+	tests := []struct {
+		name             string
+		target           string
+		callerFQN        string
+		setupFunc        func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph)
+		expectedResolved bool
+		expectedFQN      string
+		expectedType     string
+		expectedSource   string
+	}{
+		{
+			name:      "custom class method call - method exists",
+			target:    "self.controller.execute",
+			callerFQN: "service.Service.process_action",
+			setupFunc: func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph) {
+				moduleRegistry := core.NewModuleRegistry()
+				typeEngine := NewTypeInferenceEngine(moduleRegistry)
+				typeEngine.Attributes = registry.NewAttributeRegistry()
+				builtins := registry.NewBuiltinRegistry()
+				callGraph := core.NewCallGraph()
+
+				// Setup: Service class with controller attribute
+				typeEngine.Attributes.AddAttribute("service.Service", &core.ClassAttribute{
+					Name: "controller",
+					Type: &core.TypeInfo{
+						TypeFQN:    "controller.Controller",
+						Confidence: 1.0,
+						Source:     "class_instantiation",
+					},
+					Confidence: 1.0,
+				})
+
+				// Add process_action method to Service
+				classAttrs := typeEngine.Attributes.GetClassAttributes("service.Service")
+				classAttrs.Methods = append(classAttrs.Methods, "service.Service.process_action")
+
+				// Add execute method to Controller in call graph
+				callGraph.Functions["controller.Controller.execute"] = &graph.Node{
+					ID:   "func-create-user",
+					Name: "execute",
+					Type: "method",
+				}
+
+				return typeEngine, builtins, callGraph
+			},
+			expectedResolved: true,
+			expectedFQN:      "controller.Controller.execute",
+			expectedType:     "controller.Controller",
+			expectedSource:   "self_attribute_custom_class",
+		},
+		{
+			name:      "custom class method call - method does not exist",
+			target:    "self.controller.nonexistent_method",
+			callerFQN: "service.Service.process_action",
+			setupFunc: func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph) {
+				moduleRegistry := core.NewModuleRegistry()
+				typeEngine := NewTypeInferenceEngine(moduleRegistry)
+				typeEngine.Attributes = registry.NewAttributeRegistry()
+				builtins := registry.NewBuiltinRegistry()
+				callGraph := core.NewCallGraph()
+
+				// Setup: Service class with controller attribute
+				typeEngine.Attributes.AddAttribute("service.Service", &core.ClassAttribute{
+					Name: "controller",
+					Type: &core.TypeInfo{
+						TypeFQN:    "controller.Controller",
+						Confidence: 1.0,
+						Source:     "class_instantiation",
+					},
+					Confidence: 1.0,
+				})
+
+				// Add process_action method to Service
+				classAttrs := typeEngine.Attributes.GetClassAttributes("service.Service")
+				classAttrs.Methods = append(classAttrs.Methods, "service.Service.process_action")
+
+				// Note: nonexistent_method is NOT in call graph
+
+				return typeEngine, builtins, callGraph
+			},
+			expectedResolved: false,
+			expectedFQN:      "",
+		},
+		{
+			name:      "custom class with multiple methods",
+			target:    "self.adapter.to_domain_model",
+			callerFQN: "handlers.APIHandler.handle_request",
+			setupFunc: func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph) {
+				moduleRegistry := core.NewModuleRegistry()
+				typeEngine := NewTypeInferenceEngine(moduleRegistry)
+				typeEngine.Attributes = registry.NewAttributeRegistry()
+				builtins := registry.NewBuiltinRegistry()
+				callGraph := core.NewCallGraph()
+
+				// Setup: APIHandler class with adapter attribute
+				typeEngine.Attributes.AddAttribute("handlers.APIHandler", &core.ClassAttribute{
+					Name: "adapter",
+					Type: &core.TypeInfo{
+						TypeFQN:    "adapters.DBAdapter",
+						Confidence: 0.9,
+						Source:     "class_instantiation",
+					},
+					Confidence: 0.9,
+				})
+
+				// Add handle_request method to APIHandler
+				classAttrs := typeEngine.Attributes.GetClassAttributes("handlers.APIHandler")
+				classAttrs.Methods = append(classAttrs.Methods, "handlers.APIHandler.handle_request")
+
+				// Add DBAdapter methods to call graph
+				callGraph.Functions["adapters.DBAdapter.to_domain_model"] = &graph.Node{
+					ID:   "func-to-domain",
+					Name: "to_domain_model",
+					Type: "method",
+				}
+				callGraph.Functions["adapters.DBAdapter.from_domain_model"] = &graph.Node{
+					ID:   "func-from-domain",
+					Name: "from_domain_model",
+					Type: "method",
+				}
+
+				return typeEngine, builtins, callGraph
+			},
+			expectedResolved: true,
+			expectedFQN:      "adapters.DBAdapter.to_domain_model",
+			expectedType:     "adapters.DBAdapter",
+			expectedSource:   "self_attribute_custom_class",
+		},
+		{
+			name:      "static method on custom class",
+			target:    "self.validator.check_data",
+			callerFQN: "tasks.TaskProcessor.process",
+			setupFunc: func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph) {
+				moduleRegistry := core.NewModuleRegistry()
+				typeEngine := NewTypeInferenceEngine(moduleRegistry)
+				typeEngine.Attributes = registry.NewAttributeRegistry()
+				builtins := registry.NewBuiltinRegistry()
+				callGraph := core.NewCallGraph()
+
+				// Setup: TaskProcessor class with validator attribute
+				typeEngine.Attributes.AddAttribute("tasks.TaskProcessor", &core.ClassAttribute{
+					Name: "validator",
+					Type: &core.TypeInfo{
+						TypeFQN:    "tasks.validation.TaskValidator",
+						Confidence: 1.0,
+						Source:     "class_instantiation",
+					},
+					Confidence: 1.0,
+				})
+
+				// Add process method to TaskProcessor
+				classAttrs := typeEngine.Attributes.GetClassAttributes("tasks.TaskProcessor")
+				classAttrs.Methods = append(classAttrs.Methods, "tasks.TaskProcessor.process")
+
+				// Add static method to call graph (static methods are still indexed as methods)
+				callGraph.Functions["tasks.validation.TaskValidator.check_data"] = &graph.Node{
+					ID:   "func-check-data",
+					Name: "check_data",
+					Type: "method", // Static methods are type "method"
+				}
+
+				return typeEngine, builtins, callGraph
+			},
+			expectedResolved: true,
+			expectedFQN:      "tasks.validation.TaskValidator.check_data",
+			expectedType:     "tasks.validation.TaskValidator",
+			expectedSource:   "self_attribute_custom_class",
+		},
+		{
+			name:      "property call on custom class",
+			target:    "self.manager.get_config",
+			callerFQN: "app.Application.start",
+			setupFunc: func() (*TypeInferenceEngine, *registry.BuiltinRegistry, *core.CallGraph) {
+				moduleRegistry := core.NewModuleRegistry()
+				typeEngine := NewTypeInferenceEngine(moduleRegistry)
+				typeEngine.Attributes = registry.NewAttributeRegistry()
+				builtins := registry.NewBuiltinRegistry()
+				callGraph := core.NewCallGraph()
+
+				// Setup: Application class with manager attribute
+				typeEngine.Attributes.AddAttribute("app.Application", &core.ClassAttribute{
+					Name: "manager",
+					Type: &core.TypeInfo{
+						TypeFQN:    "config.ConfigManager",
+						Confidence: 1.0,
+						Source:     "class_instantiation",
+					},
+					Confidence: 1.0,
+				})
+
+				// Add start method to Application
+				classAttrs := typeEngine.Attributes.GetClassAttributes("app.Application")
+				classAttrs.Methods = append(classAttrs.Methods, "app.Application.start")
+
+				// Add property to call graph
+				callGraph.Functions["config.ConfigManager.get_config"] = &graph.Node{
+					ID:   "func-get-config",
+					Name: "get_config",
+					Type: "property",
+				}
+
+				return typeEngine, builtins, callGraph
+			},
+			expectedResolved: true,
+			expectedFQN:      "config.ConfigManager.get_config",
+			expectedType:     "config.ConfigManager",
+			expectedSource:   "self_attribute_custom_class",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			typeEngine, builtins, callGraph := tt.setupFunc()
+
+			fqn, resolved, typeInfo := ResolveSelfAttributeCall(
+				tt.target,
+				tt.callerFQN,
+				typeEngine,
+				builtins,
+				callGraph,
+			)
+
+			assert.Equal(t, tt.expectedResolved, resolved,
+				"Resolution status mismatch for %s", tt.target)
+			assert.Equal(t, tt.expectedFQN, fqn,
+				"FQN mismatch for %s", tt.target)
+
+			if tt.expectedResolved {
+				assert.NotNil(t, typeInfo, "TypeInfo should not be nil for resolved calls")
+				assert.Equal(t, tt.expectedType, typeInfo.TypeFQN,
+					"TypeInfo.TypeFQN mismatch")
+				assert.Equal(t, tt.expectedSource, typeInfo.Source,
+					"TypeInfo.Source mismatch")
+			} else {
+				assert.Nil(t, typeInfo, "TypeInfo should be nil for unresolved calls")
+			}
+		})
+	}
 }
 
 // newAttributeRegistryWithClass is a helper to create an AttributeRegistry with a single class.

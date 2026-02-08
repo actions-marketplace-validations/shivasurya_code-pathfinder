@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shivasurya/code-pathfinder/sast-engine/analytics"
+	"github.com/shivasurya/code-pathfinder/sast-engine/diff"
 	"github.com/shivasurya/code-pathfinder/sast-engine/dsl"
 	"github.com/shivasurya/code-pathfinder/sast-engine/executor"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph"
@@ -53,6 +56,7 @@ Examples:
 	// Unit testing cobra commands requires complex mocking of file systems, graph building, etc.
 	// Integration tests provide better coverage for the full execution path.
 	RunE: func(cmd *cobra.Command, args []string) error {
+		startTime := time.Now()
 		rulesPath, _ := cmd.Flags().GetString("rules")
 		rulesetSpecs, _ := cmd.Flags().GetStringArray("ruleset")
 		refreshRules, _ := cmd.Flags().GetBool("refresh-rules")
@@ -63,13 +67,33 @@ Examples:
 		outputFormat, _ := cmd.Flags().GetString("output")
 		outputFile, _ := cmd.Flags().GetString("output-file")
 		skipTests, _ := cmd.Flags().GetBool("skip-tests")
+		diffAware, _ := cmd.Flags().GetBool("diff-aware")
+		baseRef, _ := cmd.Flags().GetString("base")
+		headRef, _ := cmd.Flags().GetString("head")
+
+		// Track scan started event (no PII, just metadata)
+		analytics.ReportEventWithProperties(analytics.ScanStarted, map[string]interface{}{
+			"output_format":     outputFormat,
+			"has_local_rules":   rulesPath != "",
+			"has_remote_rules":  len(rulesetSpecs) > 0,
+			"remote_rule_count": len(rulesetSpecs),
+			"skip_tests":        skipTests,
+		})
 
 		// Validate that at least one rule source is provided
 		if len(rulesetSpecs) == 0 && rulesPath == "" {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "validation",
+				"phase":      "initialization",
+			})
 			return fmt.Errorf("either --rules or --ruleset flag is required")
 		}
 
 		if projectPath == "" {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "validation",
+				"phase":      "initialization",
+			})
 			return fmt.Errorf("--project flag is required")
 		}
 
@@ -101,6 +125,10 @@ Examples:
 		// Handle remote ruleset downloads and merge with local rules
 		finalRulesPath, tempDir, err := prepareRules(rulesPath, rulesetSpecs, refreshRules, logger)
 		if err != nil {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "rule_preparation",
+				"phase":      "initialization",
+			})
 			return fmt.Errorf("failed to prepare rules: %w", err)
 		}
 		// Clean up temporary directory if created
@@ -126,6 +154,23 @@ Examples:
 		}
 		projectPath = absProjectPath
 
+		// Diff-aware scanning (opt-in for scan command).
+		var changedFiles []string
+		if diffAware {
+			if baseRef == "" {
+				return fmt.Errorf("--base flag is required when --diff-aware is enabled")
+			}
+			if err := diff.ValidateGitRef(projectPath, baseRef); err != nil {
+				return fmt.Errorf("invalid base ref %q: %w", baseRef, err)
+			}
+			files, err := diff.ComputeChangedFiles(baseRef, headRef, projectPath)
+			if err != nil {
+				return fmt.Errorf("failed to compute changed files: %w", err)
+			}
+			changedFiles = files
+			logger.Progress("Changed files: %d", len(changedFiles))
+		}
+
 		// Create rule loader (used for both container and code analysis rules)
 		loader := dsl.NewRuleLoader(rulesPath)
 
@@ -140,6 +185,10 @@ Examples:
 		})
 		logger.FinishProgress()
 		if len(codeGraph.Nodes) == 0 {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "empty_project",
+				"phase":      "graph_building",
+			})
 			return fmt.Errorf("no source files found in project")
 		}
 		logger.Statistic("Code graph built: %d nodes", len(codeGraph.Nodes))
@@ -161,6 +210,9 @@ Examples:
 				} else {
 					logger.Progress("No container issues detected")
 				}
+			} else {
+				// Container rule loading failed - log for debugging
+				logger.Debug("Container rule loading failed: %v", err)
 			}
 		}
 
@@ -182,6 +234,10 @@ Examples:
 		cg, err := builder.BuildCallGraph(codeGraph, moduleRegistry, projectPath, logger)
 		logger.FinishProgress()
 		if err != nil {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "callgraph_build",
+				"phase":      "graph_building",
+			})
 			return fmt.Errorf("failed to build callgraph: %w", err)
 		}
 		logger.Statistic("Callgraph built: %d functions, %d call sites",
@@ -192,9 +248,22 @@ Examples:
 		rules, err := loader.LoadRules(logger)
 		logger.FinishProgress()
 		if err != nil {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "rule_loading",
+				"phase":      "rule_loading",
+			})
 			return fmt.Errorf("failed to load rules: %w", err)
 		}
 		logger.Statistic("Loaded %d rules", len(rules))
+
+		// Validate that at least one type of rule was loaded
+		if len(rules) == 0 && len(containerDetections) == 0 {
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+				"error_type": "no_rules",
+				"phase":      "rule_loading",
+			})
+			return fmt.Errorf("no rules loaded: file contains neither code analysis rules (@rule) nor container rules (@dockerfile_rule/@compose_rule)")
+		}
 
 		// Step 5: Execute rules against callgraph
 		logger.Progress("Running security scan...")
@@ -229,6 +298,14 @@ Examples:
 
 		// Merge container detections with code analysis detections
 		allEnriched = append(allEnriched, containerDetections...)
+
+		// Apply diff filter when diff-aware mode is active.
+		if diffAware && len(changedFiles) > 0 {
+			totalBefore := len(allEnriched)
+			diffFilter := output.NewDiffFilter(changedFiles)
+			allEnriched = diffFilter.Filter(allEnriched)
+			logger.Progress("Diff filter: %d/%d findings in changed files", len(allEnriched), totalBefore)
+		}
 
 		// Step 6: Format and display results
 		// Count unique rule IDs from all detections (includes both code and container rules)
@@ -318,6 +395,28 @@ Examples:
 
 		// Determine exit code based on findings and --fail-on flag
 		exitCode := output.DetermineExitCode(allEnriched, failOn, scanErrors)
+
+		// Track scan completion with results (no PII, just counts and metadata)
+		severityBreakdown := make(map[string]int)
+		for _, det := range allEnriched {
+			severityBreakdown[det.Rule.Severity]++
+		}
+
+		analytics.ReportEventWithProperties(analytics.ScanCompleted, map[string]interface{}{
+			"duration_ms":         time.Since(startTime).Milliseconds(),
+			"rules_count":         len(uniqueRules),
+			"findings_count":      len(allEnriched),
+			"diff_aware":          diffAware,
+			"diff_changed_files":  len(changedFiles),
+			"severity_critical": severityBreakdown["critical"],
+			"severity_high":     severityBreakdown["high"],
+			"severity_medium":   severityBreakdown["medium"],
+			"severity_low":      severityBreakdown["low"],
+			"output_format":     outputFormat,
+			"exit_code":         int(exitCode),
+			"had_errors":        scanErrors,
+		})
+
 		if exitCode != output.ExitCodeSuccess {
 			os.Exit(int(exitCode))
 		}
@@ -450,6 +549,18 @@ func executeContainerRules(
 	}
 
 	return enriched
+}
+
+// countContainerRules parses the container rules JSON IR and returns the total rule count.
+func countContainerRules(jsonIR []byte) int {
+	var ir struct {
+		Dockerfile []json.RawMessage `json:"dockerfile"`
+		Compose    []json.RawMessage `json:"compose"`
+	}
+	if err := json.Unmarshal(jsonIR, &ir); err != nil {
+		return 0
+	}
+	return len(ir.Dockerfile) + len(ir.Compose)
 }
 
 // generateCodeSnippet creates a code snippet with context lines around the target line.
@@ -856,5 +967,8 @@ func init() {
 	scanCmd.Flags().Bool("debug", false, "Show detailed debug diagnostics with file-level progress and timestamps")
 	scanCmd.Flags().String("fail-on", "", "Fail with exit code 1 if findings match severities (e.g., critical,high)")
 	scanCmd.Flags().Bool("skip-tests", true, "Skip test files (test_*.py, *_test.py, conftest.py, etc.)")
+	scanCmd.Flags().Bool("diff-aware", false, "Enable diff-aware scanning (only report findings in changed files)")
+	scanCmd.Flags().String("base", "", "Base git ref for diff-aware scanning (required with --diff-aware)")
+	scanCmd.Flags().String("head", "HEAD", "Head git ref for diff-aware scanning")
 	scanCmd.MarkFlagRequired("project")
 }

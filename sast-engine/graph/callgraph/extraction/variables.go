@@ -2,6 +2,7 @@ package extraction
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -29,15 +30,21 @@ import (
 //   - typeEngine: type inference engine to populate
 //   - registry: module registry for resolving module paths
 //   - builtinRegistry: builtin types registry for literal inference
+//   - importMap: import mappings for resolving class instantiations from imports
 //
 // Returns:
 //   - error: if parsing fails
+//
+// Note: Class context is tracked during AST traversal by detecting class_definition nodes.
+// This enables building class-qualified FQNs (module.ClassName.methodName) that match
+// the FQNs created during function indexing (Pass 1).
 func ExtractVariableAssignments(
 	filePath string,
 	sourceCode []byte,
 	typeEngine *resolution.TypeInferenceEngine,
 	registry *core.ModuleRegistry,
 	builtinRegistry *registry.BuiltinRegistry,
+	importMap *core.ImportMap,
 ) error {
 	// Parse with tree-sitter
 	parser := sitter.NewParser()
@@ -58,15 +65,18 @@ func ExtractVariableAssignments(
 	}
 
 	// Traverse AST to find assignments
+	// Class context is tracked during traversal by detecting class_definition nodes
 	traverseForAssignments(
 		tree.RootNode(),
 		sourceCode,
 		filePath,
 		modulePath,
 		"",
+		"",
 		typeEngine,
 		registry,
 		builtinRegistry,
+		importMap,
 	)
 
 	return nil
@@ -80,17 +90,21 @@ func ExtractVariableAssignments(
 //   - filePath: file path for locations
 //   - modulePath: module FQN
 //   - currentFunction: current function FQN (empty if module-level)
+//   - currentClass: current class name (empty if not in a class)
 //   - typeEngine: type inference engine
 //   - builtinRegistry: builtin types registry
+//   - importMap: import mappings for resolving class instantiations
 func traverseForAssignments(
 	node *sitter.Node,
 	sourceCode []byte,
 	filePath string,
 	modulePath string,
 	currentFunction string,
+	currentClass string,
 	typeEngine *resolution.TypeInferenceEngine,
 	registry *core.ModuleRegistry,
 	builtinRegistry *registry.BuiltinRegistry,
+	importMap *core.ImportMap,
 ) {
 	if node == nil {
 		return
@@ -98,14 +112,27 @@ func traverseForAssignments(
 
 	nodeType := node.Type()
 
+	// Update context when entering a class definition
+	if nodeType == "class_definition" {
+		className := extractClassName(node, sourceCode)
+		if className != "" {
+			currentClass = className
+		}
+	}
+
 	// Update context when entering function/method
 	if nodeType == "function_definition" {
 		functionName := extractFunctionName(node, sourceCode)
 		if functionName != "" {
-			if currentFunction == "" {
+			// Build class-qualified FQN for methods (matching Pass 1 behavior)
+			switch {
+			case currentClass != "":
+				// This is a method inside a class
+				currentFunction = fmt.Sprintf("%s.%s.%s", modulePath, currentClass, functionName)
+			case currentFunction == "":
 				// Module-level function
 				currentFunction = modulePath + "." + functionName
-			} else {
+			default:
 				// Nested function
 				currentFunction = currentFunction + "." + functionName
 			}
@@ -128,6 +155,7 @@ func traverseForAssignments(
 			typeEngine,
 			registry,
 			builtinRegistry,
+			importMap,
 		)
 	}
 
@@ -140,9 +168,11 @@ func traverseForAssignments(
 			filePath,
 			modulePath,
 			currentFunction,
+			currentClass,
 			typeEngine,
 			registry,
 			builtinRegistry,
+			importMap,
 		)
 	}
 }
@@ -162,6 +192,7 @@ func traverseForAssignments(
 //   - currentFunction: current function FQN (empty if module-level)
 //   - typeEngine: type inference engine
 //   - builtinRegistry: builtin types registry
+//   - importMap: import mappings for resolving class instantiations
 func processAssignment(
 	node *sitter.Node,
 	sourceCode []byte,
@@ -171,6 +202,7 @@ func processAssignment(
 	typeEngine *resolution.TypeInferenceEngine,
 	registry *core.ModuleRegistry,
 	builtinRegistry *registry.BuiltinRegistry,
+	importMap *core.ImportMap,
 ) {
 	// Assignment node structure:
 	//   assignment
@@ -208,7 +240,7 @@ func processAssignment(
 	}
 
 	// Infer type from right side
-	typeInfo := inferTypeFromExpression(rightNode, sourceCode, filePath, modulePath, registry, builtinRegistry)
+	typeInfo := inferTypeFromExpression(rightNode, sourceCode, modulePath, registry, builtinRegistry, importMap)
 	if typeInfo == nil {
 		return
 	}
@@ -257,20 +289,20 @@ func processAssignment(
 // Parameters:
 //   - node: expression AST node
 //   - sourceCode: source code bytes
-//   - filePath: file path for context
 //   - modulePath: module FQN
 //   - registry: module registry for class resolution
 //   - builtinRegistry: builtin types registry
+//   - importMap: import mappings for resolving class instantiations from imports
 //
 // Returns:
 //   - TypeInfo if type can be inferred, nil otherwise
 func inferTypeFromExpression(
 	node *sitter.Node,
 	sourceCode []byte,
-	filePath string,
 	modulePath string,
 	registry *core.ModuleRegistry,
 	builtinRegistry *registry.BuiltinRegistry,
+	importMap *core.ImportMap,
 ) *core.TypeInfo {
 	if node == nil {
 		return nil
@@ -282,7 +314,18 @@ func inferTypeFromExpression(
 	if nodeType == "call" {
 		// First, try to resolve as class instantiation (e.g., User(), HttpResponse())
 		// This handles PascalCase patterns immediately without creating placeholders
-		importMap := core.NewImportMap(filePath)
+		//
+		// CROSS-FILE IMPORT RESOLUTION:
+		// Use the provided importMap (from file's actual imports) to resolve class names
+		// from other modules. This enables patterns like:
+		//   from module_a import Calculator
+		//   calc = Calculator()  # ← resolves to module_a.Calculator (not local)
+		//   result = calc.add()  # ← resolves to module_a.Calculator.add
+		//
+		// Edge cases handled:
+		// - Inline object creation: Calculator().add(1, 2)
+		// - Multi-line chained calls: Calculator()\n    .add(1, 2)\n    .get_result()
+		// - Null/empty importMap (tests): Falls back to heuristic resolution
 		classType := resolution.ResolveClassInstantiation(node, sourceCode, modulePath, importMap, registry)
 		if classType != nil {
 			return classType
@@ -303,6 +346,12 @@ func inferTypeFromExpression(
 				}
 			}
 		}
+	}
+
+	// Handle boolean operators (or, and)
+	// Supports conditional patterns: x = param or Class()
+	if nodeType == "boolean_operator" {
+		return inferFromBooleanOp(node, sourceCode, modulePath, registry, builtinRegistry, importMap)
 	}
 
 	// Handle literals
@@ -369,6 +418,97 @@ func inferTypeFromExpression(
 	return builtinRegistry.InferLiteralType(literal)
 }
 
+// inferFromBooleanOp infers type from boolean operator expressions.
+//
+// Handles conditional patterns for local variables:
+//   - x or Y(): Prefer right operand (concrete value over None/falsy)
+//   - x and Y(): Prefer left operand
+//   - x or y or Z(): Recursively process nested operators
+//
+// Examples:
+//   - config or Settings() → type: Settings (confidence: 0.855)
+//   - x or None → type: NoneType (confidence: 0.95)
+//   - enabled and "active" → type: str (confidence: 0.93)
+//
+// Parameters:
+//   - node: boolean_operator AST node
+//   - sourceCode: source code bytes
+//   - modulePath: module FQN for class resolution
+//   - registry: module registry
+//   - builtinRegistry: builtin types registry
+//   - importMap: import mappings
+//
+// Returns:
+//   - TypeInfo with inferred type and adjusted confidence, or nil if cannot infer
+func inferFromBooleanOp(
+	node *sitter.Node,
+	sourceCode []byte,
+	modulePath string,
+	registry *core.ModuleRegistry,
+	builtinRegistry *registry.BuiltinRegistry,
+	importMap *core.ImportMap,
+) *core.TypeInfo {
+	// Find operator and operands by traversing children
+	var operator string
+	var leftNode, rightNode *sitter.Node
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+
+		switch child.Type() {
+		case "or", "and":
+			operator = child.Type()
+		default:
+			// Capture first two non-operator nodes as operands
+			if leftNode == nil {
+				leftNode = child
+			} else if rightNode == nil {
+				rightNode = child
+			}
+		}
+	}
+
+	if leftNode == nil || operator == "" {
+		return nil
+	}
+
+	// For "or": prefer right operand (concrete value over None/falsy)
+	// Example: config or Settings() → infer Settings
+	if operator == "or" && rightNode != nil {
+		rightType := inferTypeFromExpression(rightNode, sourceCode, modulePath, registry, builtinRegistry, importMap)
+		if rightType != nil && rightType.TypeFQN != "builtins.NoneType" {
+			// Apply confidence penalty for conditional pattern
+			rightType.Confidence *= 0.95
+			rightType.Source = "boolean_or_" + rightType.Source
+			return rightType
+		}
+
+		// Fallback to left operand if right is None or cannot be inferred
+		leftType := inferTypeFromExpression(leftNode, sourceCode, modulePath, registry, builtinRegistry, importMap)
+		if leftType != nil {
+			leftType.Confidence *= 0.90
+			leftType.Source = "boolean_or_" + leftType.Source
+			return leftType
+		}
+	}
+
+	// For "and": prefer left operand
+	// Example: enabled and "active" → infer from "active"
+	if operator == "and" {
+		leftType := inferTypeFromExpression(leftNode, sourceCode, modulePath, registry, builtinRegistry, importMap)
+		if leftType != nil {
+			leftType.Confidence *= 0.93
+			leftType.Source = "boolean_and_" + leftType.Source
+			return leftType
+		}
+	}
+
+	return nil
+}
+
 // extractFunctionName extracts the function name from a function_definition node.
 func extractFunctionName(node *sitter.Node, sourceCode []byte) string {
 	if node.Type() != "function_definition" {
@@ -419,3 +559,4 @@ func extractCalleeName(node *sitter.Node, sourceCode []byte) string {
 
 	return ""
 }
+
