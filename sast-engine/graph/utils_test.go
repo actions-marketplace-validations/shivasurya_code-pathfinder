@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -160,7 +159,7 @@ public void toString() {
 			defer tree.Close()
 
 			root := tree.RootNode()
-			
+
 			// Find the relevant node
 			var targetNode *sitter.Node
 			var findNode func(*sitter.Node)
@@ -200,7 +199,7 @@ public void toString() {
 
 func TestGetFilesComprehensive(t *testing.T) {
 	// Create temp directory structure
-	tmpDir, err := ioutil.TempDir("", "test_getfiles")
+	tmpDir, err := os.MkdirTemp("", "test_getfiles")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
@@ -228,13 +227,13 @@ func TestGetFilesComprehensive(t *testing.T) {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatalf("Failed to create directory: %v", err)
 		}
-		if err := ioutil.WriteFile(fullPath, []byte("test content"), 0644); err != nil {
+		if err := os.WriteFile(fullPath, []byte("test content"), 0644); err != nil {
 			t.Fatalf("Failed to create file: %v", err)
 		}
 	}
 
 	// Test getFiles
-	files, err := getFiles(tmpDir)
+	files, _, err := getFiles(tmpDir, nil)
 	if err != nil {
 		t.Fatalf("getFiles failed: %v", err)
 	}
@@ -260,6 +259,88 @@ func TestGetFilesComprehensive(t *testing.T) {
 	}
 }
 
+// TestGetFilesIncludesCAndCpp asserts that getFiles discovers every
+// supported C and C++ source/header extension and skips the build-artifact
+// directories that are typical in C/C++ projects (build/, cmake-build-*,
+// third_party/, external/, obj/, bin/, dist/, .cache/).
+func TestGetFilesIncludesCAndCpp(t *testing.T) {
+	dir, err := os.MkdirTemp("", "getfiles_clike")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	files := []string{
+		"a.c", "b.cpp", "c.cc", "d.cxx",
+		"e.h", "f.hpp", "g.hh", "h.hxx",
+		"keep.java", "keep.py", "keep.go",
+		"build/skip.c",
+		"cmake-build-debug/skip.cpp",
+		"cmake-build-release/skip.h",
+		"cmake-build-foo/skip.cpp",
+		"third_party/skip.c",
+		"external/skip.h",
+		"obj/skip.c",
+		"bin/skip.cpp",
+		"dist/skip.h",
+		".cache/skip.c",
+		"src/keep.cpp",
+		"include/keep.hpp",
+	}
+
+	for _, f := range files {
+		full := filepath.Join(dir, f)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("// stub\n"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	got, _, err := getFiles(dir, nil)
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+
+	gotSet := make(map[string]bool, len(got))
+	for _, p := range got {
+		rel, _ := filepath.Rel(dir, p)
+		gotSet[rel] = true
+	}
+
+	wantPresent := []string{
+		"a.c", "b.cpp", "c.cc", "d.cxx",
+		"e.h", "f.hpp", "g.hh", "h.hxx",
+		"keep.java", "keep.py", "keep.go",
+		filepath.Join("src", "keep.cpp"),
+		filepath.Join("include", "keep.hpp"),
+	}
+	for _, w := range wantPresent {
+		if !gotSet[w] {
+			t.Errorf("expected %q in result, missing", w)
+		}
+	}
+
+	wantAbsent := []string{
+		filepath.Join("build", "skip.c"),
+		filepath.Join("cmake-build-debug", "skip.cpp"),
+		filepath.Join("cmake-build-release", "skip.h"),
+		filepath.Join("cmake-build-foo", "skip.cpp"),
+		filepath.Join("third_party", "skip.c"),
+		filepath.Join("external", "skip.h"),
+		filepath.Join("obj", "skip.c"),
+		filepath.Join("bin", "skip.cpp"),
+		filepath.Join("dist", "skip.h"),
+		filepath.Join(".cache", "skip.c"),
+	}
+	for _, w := range wantAbsent {
+		if gotSet[w] {
+			t.Errorf("expected %q to be excluded but found in result", w)
+		}
+	}
+}
+
 func TestGetFilesErrors(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -280,12 +361,12 @@ func TestGetFilesErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			files, err := getFiles(tt.directory)
-			
+			files, _, err := getFiles(tt.directory, nil)
+
 			if tt.wantError && err == nil {
 				t.Error("Expected error but got none")
 			}
-			
+
 			if err == nil && len(files) > 0 {
 				t.Errorf("Expected empty files list for invalid directory, got %d files", len(files))
 			}
@@ -295,7 +376,7 @@ func TestGetFilesErrors(t *testing.T) {
 
 func TestReadFileComprehensive(t *testing.T) {
 	// Create temp file
-	tmpFile, err := ioutil.TempFile("", "test_readfile_*.java")
+	tmpFile, err := os.CreateTemp("", "test_readfile_*.java")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
@@ -326,7 +407,7 @@ func TestReadFileComprehensive(t *testing.T) {
 	})
 
 	t.Run("Read empty file", func(t *testing.T) {
-		emptyFile, err := ioutil.TempFile("", "test_empty_*.java")
+		emptyFile, err := os.CreateTemp("", "test_empty_*.java")
 		if err != nil {
 			t.Fatalf("Failed to create empty file: %v", err)
 		}
@@ -344,7 +425,7 @@ func TestReadFileComprehensive(t *testing.T) {
 	})
 
 	t.Run("Read large file", func(t *testing.T) {
-		largeFile, err := ioutil.TempFile("", "test_large_*.java")
+		largeFile, err := os.CreateTemp("", "test_large_*.java")
 		if err != nil {
 			t.Fatalf("Failed to create large file: %v", err)
 		}
@@ -462,9 +543,9 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 	t.Run("Append to empty slice", func(t *testing.T) {
 		var slice []*Node
 		node := &Node{ID: "test1", Name: "Node1"}
-		
+
 		result := appendUnique(slice, node)
-		
+
 		if len(result) != 1 {
 			t.Errorf("Expected length 1, got %d", len(result))
 		}
@@ -477,11 +558,11 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 		node1 := &Node{ID: "test1", Name: "Node1"}
 		node2 := &Node{ID: "test2", Name: "Node2"}
 		node3 := &Node{ID: "test3", Name: "Node3"}
-		
+
 		slice := []*Node{node1}
 		slice = appendUnique(slice, node2)
 		slice = appendUnique(slice, node3)
-		
+
 		if len(slice) != 3 {
 			t.Errorf("Expected length 3, got %d", len(slice))
 		}
@@ -490,9 +571,9 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 	t.Run("Append duplicate node", func(t *testing.T) {
 		node := &Node{ID: "test1", Name: "Node1"}
 		slice := []*Node{node}
-		
+
 		result := appendUnique(slice, node)
-		
+
 		if len(result) != 1 {
 			t.Errorf("Expected length 1 after duplicate, got %d", len(result))
 		}
@@ -504,12 +585,12 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 	t.Run("Multiple duplicates", func(t *testing.T) {
 		node1 := &Node{ID: "test1"}
 		node2 := &Node{ID: "test2"}
-		
+
 		slice := []*Node{node1, node2}
 		slice = appendUnique(slice, node1)
 		slice = appendUnique(slice, node2)
 		slice = appendUnique(slice, node1)
-		
+
 		if len(slice) != 2 {
 			t.Errorf("Expected length 2, got %d", len(slice))
 		}
@@ -518,7 +599,7 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 	t.Run("Nil node", func(t *testing.T) {
 		slice := []*Node{&Node{ID: "test1"}}
 		result := appendUnique(slice, nil)
-		
+
 		if len(result) != 2 {
 			t.Errorf("Expected length 2, got %d", len(result))
 		}
@@ -528,7 +609,7 @@ func TestAppendUniqueComprehensive(t *testing.T) {
 func TestFormatTypeComprehensive(t *testing.T) {
 	tests := []struct {
 		name     string
-		input    interface{}
+		input    any
 		expected string
 	}{
 		{"String", "hello world", "hello world"},
@@ -542,10 +623,10 @@ func TestFormatTypeComprehensive(t *testing.T) {
 		{"Bool true", true, "true"},
 		{"Bool false", false, "false"},
 		{"Nil", nil, "<nil>"},
-		{"Empty slice", []interface{}{}, "[]"},
-		{"Int slice", []interface{}{1, 2, 3}, "[1,2,3]"},
-		{"Mixed slice", []interface{}{1, "two", 3.0}, "[1,\"two\",3]"},
-		{"Nested slice", []interface{}{[]interface{}{1, 2}, []interface{}{3, 4}}, "[[1,2],[3,4]]"},
+		{"Empty slice", []any{}, "[]"},
+		{"Int slice", []any{1, 2, 3}, "[1,2,3]"},
+		{"Mixed slice", []any{1, "two", 3.0}, "[1,\"two\",3]"},
+		{"Nested slice", []any{[]any{1, 2}, []any{3, 4}}, "[[1,2],[3,4]]"},
 		{"Struct", struct{ Name string }{"test"}, "{test}"},
 	}
 
@@ -634,6 +715,248 @@ func TestIsGitHubActionsComprehensive(t *testing.T) {
 		})
 	}
 }
+
+// TestIsExcludedPath covers the graph-internal prefix-match helper.
+func TestIsExcludedPath(t *testing.T) {
+	cases := []struct {
+		rel      string
+		patterns []string
+		want     bool
+	}{
+		{"rules/foo.py", []string{"rules"}, true},
+		{"rulesx/foo.py", []string{"rules"}, false},        // no separator boundary
+		{"rules", []string{"rules"}, true},                 // exact match
+		{"sast-engine/cmd/scan.go", []string{"rules"}, false},
+		{"a/b/c.py", []string{"a/b"}, true},
+		{"a/b/c.py", []string{"a"}, true},
+		{"a/b/c.py", []string{"x"}, false},
+		{"any.py", []string{""}, false},                    // empty pattern is no-op
+		{"any.py", nil, false},
+	}
+	for _, c := range cases {
+		got := isExcludedPath(c.rel, c.patterns)
+		if got != c.want {
+			t.Errorf("isExcludedPath(%q, %v) = %v, want %v", c.rel, c.patterns, got, c.want)
+		}
+	}
+}
+
+// TestGetFilesWithExcludePatterns verifies that getFiles skips files whose
+// repo-relative path starts with an excluded prefix.
+func TestGetFilesWithExcludePatterns(t *testing.T) {
+	dir, err := os.MkdirTemp("", "getfiles_exclude")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create a small project layout:
+	//   src/main.py      (include)
+	//   rules/rule.py    (exclude via "rules")
+	//   rulesx/other.py  (include, must NOT be caught by "rules" prefix)
+	layout := []string{
+		"src/main.py",
+		"rules/rule.py",
+		"rulesx/other.py",
+	}
+	for _, f := range layout {
+		full := filepath.Join(dir, f)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("# stub\n"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	got, _, err := getFiles(dir, []string{"rules"})
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+
+	gotSet := make(map[string]bool, len(got))
+	for _, p := range got {
+		rel, _ := filepath.Rel(dir, p)
+		gotSet[filepath.ToSlash(rel)] = true
+	}
+
+	if gotSet["rules/rule.py"] {
+		t.Error("rules/rule.py should have been excluded but was returned")
+	}
+	if !gotSet["src/main.py"] {
+		t.Error("src/main.py should be included but was missing")
+	}
+	if !gotSet["rulesx/other.py"] {
+		t.Error("rulesx/other.py should be included (prefix 'rules' must not match 'rulesx')")
+	}
+}
+
+// TestGetFilesExcludeIndividualFile exercises the file-level (non-directory)
+// exclude branch in getFiles: the excluded pattern targets a single file, not
+// a directory subtree.
+func TestGetFilesExcludeIndividualFile(t *testing.T) {
+	dir, err := os.MkdirTemp("", "getfiles_exclude_file")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	layout := []string{
+		"src/keep.py",
+		"src/skip_me.py",
+	}
+	for _, f := range layout {
+		full := filepath.Join(dir, f)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("# stub\n"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	got, _, err := getFiles(dir, []string{"src/skip_me.py"})
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+	gotSet := make(map[string]bool, len(got))
+	for _, p := range got {
+		rel, _ := filepath.Rel(dir, p)
+		gotSet[filepath.ToSlash(rel)] = true
+	}
+	if gotSet["src/skip_me.py"] {
+		t.Error("src/skip_me.py should have been excluded but was returned")
+	}
+	if !gotSet["src/keep.py"] {
+		t.Error("src/keep.py should be included")
+	}
+}
+
+// --- ProjectStats integration coverage on getFiles -----------------------
+
+// TestGetFiles_ProjectStats_OnlyUnsupported exercises the empty-graph
+// branch's input: a directory where every regular file is in a language
+// pathfinder doesn't analyze. ScannedFiles must be 0, TotalFiles must equal
+// the number of real files seen, ByLanguage must bucket them.
+func TestGetFiles_ProjectStats_OnlyUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		"src/app.ts",
+		"src/util.ts",
+		"src/index.js",
+		"README.md",
+		"package.json",
+	}
+	for _, rel := range files {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("// stub\n"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	got, stats, err := getFiles(dir, nil)
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected zero scanned files, got %d (%v)", len(got), got)
+	}
+	if stats.ScannedFiles != 0 {
+		t.Errorf("ScannedFiles = %d, want 0", stats.ScannedFiles)
+	}
+	if stats.TotalFiles != len(files) {
+		t.Errorf("TotalFiles = %d, want %d", stats.TotalFiles, len(files))
+	}
+	if got, want := stats.ByLanguage["TypeScript"], 2; got != want {
+		t.Errorf("TypeScript = %d, want %d", got, want)
+	}
+	if got, want := stats.ByLanguage["JavaScript"], 1; got != want {
+		t.Errorf("JavaScript = %d, want %d", got, want)
+	}
+	if got, want := stats.ByLanguage["Markdown"], 1; got != want {
+		t.Errorf("Markdown = %d, want %d", got, want)
+	}
+	if got, want := stats.ByLanguage["JSON"], 1; got != want {
+		t.Errorf("JSON = %d, want %d", got, want)
+	}
+}
+
+// TestGetFiles_ProjectStats_Mixed verifies stats when supported and
+// unsupported files coexist. ScannedFiles should reflect only supported.
+func TestGetFiles_ProjectStats_Mixed(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		"Main.java",         // supported
+		"app/api.py",        // supported
+		"web/index.ts",      // unsupported
+		"web/styles.css",    // unsupported
+	}
+	for _, rel := range files {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("// stub\n"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	got, stats, err := getFiles(dir, nil)
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2", len(got))
+	}
+	if stats.ScannedFiles != 2 {
+		t.Errorf("ScannedFiles = %d, want 2", stats.ScannedFiles)
+	}
+	if stats.TotalFiles != 4 {
+		t.Errorf("TotalFiles = %d, want 4", stats.TotalFiles)
+	}
+	if stats.UnsupportedFileCount() != 2 {
+		t.Errorf("UnsupportedFileCount = %d, want 2", stats.UnsupportedFileCount())
+	}
+}
+
+// TestGetFiles_ProjectStats_SkipDirsNotCounted confirms files inside the
+// always-skipped directories (node_modules, vendor, .git, ...) do NOT
+// inflate the stats, even though the walker descends into the parent path.
+func TestGetFiles_ProjectStats_SkipDirsNotCounted(t *testing.T) {
+	dir := t.TempDir()
+	for _, rel := range []string{
+		"src/app.ts",
+		"node_modules/foo/index.js",
+		"node_modules/foo/package.json",
+		"vendor/bar/lib.go",
+		".git/HEAD",
+	} {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("stub"), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	_, stats, err := getFiles(dir, nil)
+	if err != nil {
+		t.Fatalf("getFiles: %v", err)
+	}
+	// Only src/app.ts should be counted.
+	if stats.TotalFiles != 1 {
+		t.Errorf("TotalFiles = %d, want 1 (everything else lives under skip dirs)", stats.TotalFiles)
+	}
+	if stats.ByLanguage["TypeScript"] != 1 {
+		t.Errorf("TypeScript = %d, want 1", stats.ByLanguage["TypeScript"])
+	}
+	if _, ok := stats.ByLanguage["JavaScript"]; ok {
+		t.Error("JavaScript must not be counted (lives in node_modules)")
+	}
+}
+
 
 func BenchmarkGenerateMethodID(b *testing.B) {
 	params := []string{"int", "String", "Object"}

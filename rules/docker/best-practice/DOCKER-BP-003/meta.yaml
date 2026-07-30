@@ -1,0 +1,58 @@
+id: DOCKER-BP-003
+name: Deprecated MAINTAINER Instruction
+short_description: MAINTAINER instruction is deprecated. Use LABEL org.opencontainers.image.authors instead.
+severity: INFO
+category: best-practice
+language: docker
+ruleset: docker/DOCKER-BP-003
+cwe:
+- id: CWE-710
+  name: Improper Adherence to Coding Standards
+  url: https://cwe.mitre.org/data/definitions/710.html
+tags:
+- docker
+- dockerfile
+- maintainer
+- label
+- deprecated
+- metadata
+- best-practice
+- oci
+- standards
+- legacy
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'This rule detects usage of the deprecated MAINTAINER instruction. The MAINTAINER
+
+  instruction has been deprecated since Docker 1.13 (January 2017) in favor of using
+
+  LABEL instructions with standardized metadata keys. Using deprecated features can
+
+  lead to compatibility issues with newer Docker versions and tooling.'
+message: MAINTAINER instruction is deprecated. Use LABEL org.opencontainers.image.authors instead.
+secure_example: ''
+recommendations:
+  - "Review your Dockerfile to address the deprecated maintainer instruction issue"
+  - "Follow Docker official best practices for image building"
+  - "Use docker build --check to validate Dockerfile syntax and best practices"
+detection_scope: ''
+references:
+- title: OCI Image Specification - Annotations
+  url: https://github.com/opencontainers/image-spec/blob/main/annotations.md
+- title: Docker LABEL documentation
+  url: https://docs.docker.com/reference/dockerfile/#label
+- title: Docker Deprecated Features
+  url: https://docs.docker.com/engine/deprecated/
+- title: Label Schema Convention (historical reference)
+  url: https://label-schema.org/
+compliance: []
+faq:
+  - question: "Why does this rule flag deprecated maintainer instruction?"
+    answer: "MAINTAINER instruction is deprecated. Use LABEL org.opencontainers.image.authors instead."
+  - question: "How do I fix this?"
+    answer: "Review the secure code example in the playground above and apply the recommended pattern to your Dockerfile or docker-compose.yml."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

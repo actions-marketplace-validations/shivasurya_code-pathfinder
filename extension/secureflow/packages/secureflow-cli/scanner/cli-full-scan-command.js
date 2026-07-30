@@ -45,7 +45,7 @@ class CLIFullScanCommand {
    */
   async execute(projectPath, options = {}) {
     const startTime = Date.now();
-    this.log(magenta('🛡️  SecureFlow Full Security Scan'));
+    this.log(magenta('🛡️  Code Pathfinder Full Security Scan'));
     this.log(dim(`Project: ${path.resolve(projectPath)}`));
     this.log(dim(`Model: ${this.selectedModel || 'default'}`));
     this.log('');
@@ -86,7 +86,7 @@ class CLIFullScanCommand {
       const reviewPrompt = await loadPrompt('common/security-review-cli.txt');
 
       // Initialize token tracker
-      const model = this.selectedModel || config.model || 'claude-sonnet-4-5-20250929';
+      const model = this.selectedModel || config.model || 'claude-sonnet-4-6';
       this.tokenTracker = new TokenTracker(model);
 
       // Initialize AI client
@@ -186,7 +186,7 @@ class CLIFullScanCommand {
    * Create AI client based on configuration
    */
   _createAIClient(config) {
-    const model = this.selectedModel || config.model || 'claude-sonnet-4-5-20250929';
+    const model = this.selectedModel || config.model || 'claude-sonnet-4-6';
     const aiClient = AIClientFactory.getClient(model);
     
     // Create wrapper that matches our expected interface
@@ -285,7 +285,7 @@ class CLIFullScanCommand {
    */
   _outputTextResults(scanResult, analysisResult) {
     this.log('\n' + '='.repeat(60));
-    this.log(magenta('🛡️  SECUREFLOW SECURITY SCAN RESULTS'));
+    this.log(magenta('🛡️  CODE PATHFINDER SECURITY SCAN RESULTS'));
     this.log('='.repeat(60));
     
     this.log(`📅 Timestamp: ${scanResult.timestamp}`);
@@ -321,7 +321,7 @@ class CLIFullScanCommand {
    * Generate text output for file saving
    */
   _generateTextOutput(scanResult, analysisResult) {
-    let output = 'SECUREFLOW SECURITY SCAN RESULTS\n';
+    let output = 'CODE PATHFINDER SECURITY SCAN RESULTS\n';
     output += '='.repeat(60) + '\n\n';
     
     output += `Timestamp: ${scanResult.timestamp}\n`;

@@ -129,17 +129,28 @@ func (f *TextFormatter) writeDetailedFinding(det *dsl.EnrichedDetection) {
 	}
 	fmt.Fprintln(f.writer)
 
-	// Location
-	location := f.formatLocation(det.Location)
-	fmt.Fprintf(f.writer, "    %s\n", location)
-
-	// Code snippet
-	if len(det.Snippet.Lines) > 0 {
-		f.writeCodeSnippet(det.Snippet)
+	// For inter-procedural taint: show source then sink
+	if det.DetectionType == dsl.DetectionTypeTaintGlobal && len(det.SourceSnippet.Lines) > 0 {
+		sourceLocation := f.formatLocation(det.SourceLocation)
+		fmt.Fprintf(f.writer, "    Source: %s\n", sourceLocation)
+		f.writeCodeSnippet(det.SourceSnippet)
+		fmt.Fprintln(f.writer)
+		fmt.Fprintf(f.writer, "    Sink: %s\n", f.formatLocation(det.Location))
+		if len(det.Snippet.Lines) > 0 {
+			f.writeCodeSnippet(det.Snippet)
+		}
+	} else {
+		// Location
+		location := f.formatLocation(det.Location)
+		fmt.Fprintf(f.writer, "    %s\n", location)
+		// Code snippet
+		if len(det.Snippet.Lines) > 0 {
+			f.writeCodeSnippet(det.Snippet)
+		}
 	}
 	fmt.Fprintln(f.writer)
 
-	// Taint flow (for taint detections)
+	// Taint flow (for taint detections with named variable)
 	if det.DetectionType == dsl.DetectionTypeTaintLocal || det.DetectionType == dsl.DetectionTypeTaintGlobal {
 		f.writeTaintFlow(det)
 	}
@@ -203,11 +214,19 @@ func (f *TextFormatter) writeTaintFlow(det *dsl.EnrichedDetection) {
 		return
 	}
 
-	fmt.Fprintf(f.writer, "    Flow: %s (line %d) -> %s (line %d)\n",
+	sourceRef := fmt.Sprintf("line %d", det.Detection.SourceLine)
+	if det.Detection.SourceFile != "" {
+		sourceRef = fmt.Sprintf("%s:%d", det.Detection.SourceFile, det.Detection.SourceLine)
+	}
+	sinkRef := fmt.Sprintf("line %d", det.Detection.SinkLine)
+	if det.Detection.SinkFile != "" {
+		sinkRef = fmt.Sprintf("%s:%d", det.Detection.SinkFile, det.Detection.SinkLine)
+	}
+	fmt.Fprintf(f.writer, "    Flow: %s (%s) -> %s (%s)\n",
 		det.Detection.TaintedVar,
-		det.Detection.SourceLine,
+		sourceRef,
 		det.Detection.SinkCall,
-		det.Detection.SinkLine)
+		sinkRef)
 
 	fmt.Fprintf(f.writer, "    Tainted variable '%s' reaches dangerous sink without sanitization\n",
 		det.Detection.TaintedVar)

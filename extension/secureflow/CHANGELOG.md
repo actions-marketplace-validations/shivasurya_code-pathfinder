@@ -1,4 +1,36 @@
-# SecureFlow Changelog
+# Code Pathfinder Changelog
+
+## Version 0.0.19 - March 7, 2026
+
+### What's New
+
+- **Next-Gen AI Models**: Added latest flagship models from all major providers
+  - **GPT-5.4 & GPT-5.4 Pro**: OpenAI's most capable models (1.05M context, 128K output)
+  - **Claude Opus 4.6**: Anthropic's most intelligent model for agents and code (200K context, 128K output, 1M beta)
+  - **Claude Sonnet 4.6**: New recommended default — best combination of speed and intelligence (200K context, 64K output, 1M beta)
+  - **Gemini 3.1 Pro Preview**: Google's latest with advanced agentic and coding capabilities (1M context)
+- **Updated OpenRouter Models**: Upgraded to latest versions of open-source models
+  - Qwen3 Coder → **Qwen3 Coder Next** (262K context/output)
+  - GLM 4.7 → **GLM 5** (202K context/output)
+  - MiniMax M2 → **MiniMax M2.5** (196K context/output)
+  - Added **Kimi K2.5** — multimodal model with visual coding capabilities (262K context/output)
+- **xAI Grok Models**: Added to model-context-limits configuration for full parity
+
+### Improvements
+
+- **Default Model Updated**: Changed default from deprecated Claude Sonnet 4.5 to Claude Sonnet 4.6 across all components
+- **Spec Accuracy Fixes**: Corrected pre-existing specification errors verified against official docs
+  - GPT-5 Mini: contextWindow 200K→400K, maxOutput 64K→128K
+  - GPT-5 Pro: maxOutput 128K→272K
+  - GPT-5 Nano: contextWindow 128K→400K, maxOutput 32K→128K
+  - OpenRouter model maxOutput values corrected to match official specs
+- **Updated Documentation**: Refreshed README and CLI README with current model listings
+
+### Deprecated
+
+- **Claude Sonnet 4.5** (`claude-sonnet-4-5-20250929`): Superseded by Claude Sonnet 4.6
+- **Claude Opus 4.5** (`claude-opus-4-5`): Superseded by Claude Opus 4.6
+- **Gemini 3 Pro** (`gemini-3-pro-preview`): Shutting down March 9, 2026 — use Gemini 3.1 Pro instead
 
 ## Version 0.0.18 - December 27, 2025
 
@@ -67,7 +99,7 @@
 
 ### 🚀 What's New?
 
-- **Secureflow CLI Package**: Introduced standalone CLI tool for security analysis outside VS Code
+- **Code Pathfinder CLI Package**: Introduced standalone CLI tool for security analysis outside VS Code
 - **Grok AI Model Support**: Added Grok 4 Fast Reasoning AI model support for enhanced security analysis
 - **Say bye to claude-sonnet-3-5 model**: Removed deprecated claude-sonnet-3-5 model
 
@@ -79,7 +111,7 @@
 
 ### 🚀 What's New?
 
-- **SecureFlow CLI Package**: Introduced standalone CLI tool for security analysis outside VS Code
+- **Code Pathfinder CLI Package**: Introduced standalone CLI tool for security analysis outside VS Code
 - **AI-Powered Security Scanner**: New iterative file analysis system with intelligent file request handling
 - **Full Workspace Scanning**: Comprehensive security scanning with up to 10 iterations for thorough analysis
 - **CLI Project Profiling**: AI-powered workspace analysis and profiling capabilities via command line
@@ -170,15 +202,15 @@
 ## Version 0.0.3 - July 27, 2025
 
 ### 🎯 What's New?
-- **Gemini Client**: SecureFlow now supports Gemini 2.5 Pro and Gemini 2.5 Flash models.
-- **Analytics**: SecureFlow now collects anonymous usage data to help improve the product. Only aggregated usage metrics are collected with no personal information. Restart Editor to apply this change.
+- **Gemini Client**: Code Pathfinder now supports Gemini 2.5 Pro and Gemini 2.5 Flash models.
+- **Analytics**: Code Pathfinder now collects anonymous usage data to help improve the product. Only aggregated usage metrics are collected with no personal information. Restart Editor to apply this change.
   - **AI Model** - AI model used for security analysis
   
 
 ## Version 0.0.2 - July 26, 2025
 
 ### 🎯 What's New?
-- **Analytics**: SecureFlow now collects anonymous usage data to help improve the product. Only aggregated usage metrics are collected with no personal information. Restart Editor to apply this change.
+- **Analytics**: Code Pathfinder now collects anonymous usage data to help improve the product. Only aggregated usage metrics are collected with no personal information. Restart Editor to apply this change.
 
 ## Version 0.0.1 - July 25, 2025
 
@@ -211,9 +243,9 @@
 - Simple setup with minimal configuration
 
 ### 🔧 Getting Started
-1. Install SecureFlow from VS Code Marketplace
+1. Install Code Pathfinder from VS Code Marketplace
 2. Add your preferred AI model's API key
-3. Start coding - SecureFlow works automatically in the background
+3. Start coding - Code Pathfinder works automatically in the background
 
 ### 📝 Note
 This is our first release! We're actively working on improvements and would love your feedback.

@@ -1,15 +1,24 @@
 package dsl
 
+import (
+	"encoding/json"
+
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
+)
+
 // IRType represents the type of IR node.
 type IRType string
 
 const (
-	IRTypeCallMatcher     IRType = "call_matcher"
-	IRTypeVariableMatcher IRType = "variable_matcher"
-	IRTypeDataflow        IRType = "dataflow"
-	IRTypeLogicAnd        IRType = "logic_and"
-	IRTypeLogicOr         IRType = "logic_or"
-	IRTypeLogicNot        IRType = "logic_not"
+	IRTypeCallMatcher              IRType = "call_matcher"
+	IRTypeVariableMatcher          IRType = "variable_matcher"
+	IRTypeDataflow                 IRType = "dataflow"
+	IRTypeLogicAnd                 IRType = "logic_and"
+	IRTypeLogicOr                  IRType = "logic_or"
+	IRTypeLogicNot                 IRType = "logic_not"
+	IRTypeTypeConstrainedCall      IRType = "type_constrained_call"
+	IRTypeTypeConstrainedAttribute IRType = "type_constrained_attribute"
+	IRTypeAttributeMatcher         IRType = "attribute_matcher"
 )
 
 // MatcherIR is the base interface for all matcher IR types.
@@ -22,11 +31,30 @@ type ArgumentConstraint struct {
 	// Value is the expected argument value(s).
 	// Can be a single value or a list of acceptable values (OR logic).
 	// Examples: "0.0.0.0", "true", "777", ["Loader", "UnsafeLoader"]
-	Value interface{} `json:"value"`
+	Value any `json:"value"`
 
 	// Wildcard enables pattern matching with * and ? in Value.
 	// Example: "0o7*" matches "0o777", "0o755", etc.
 	Wildcard bool `json:"wildcard"`
+
+	// Comparator specifies the comparison mode for the value.
+	// Supported: "lt", "gt", "lte", "gte", "regex", "missing", "" (exact/wildcard).
+	Comparator string `json:"comparator,omitempty"`
+}
+
+// TrackedParam specifies a parameter that is taint-sensitive in dataflow analysis.
+// Exactly one of Index, Name, or Return should be set.
+type TrackedParam struct {
+	// Index is the 0-based positional parameter index.
+	// Pointer type so that index 0 is distinguishable from "not set".
+	Index *int `json:"index,omitempty"`
+
+	// Name is the parameter name (e.g., "query", "args").
+	// Resolved to a positional index at analysis time via function signature.
+	Name string `json:"name,omitempty"`
+
+	// Return is true when tracking the return value (used for source matchers).
+	Return bool `json:"return,omitempty"`
 }
 
 // CallMatcherIR represents call_matcher JSON IR.
@@ -38,7 +66,7 @@ type CallMatcherIR struct {
 
 	// PositionalArgs maps positional argument index (as string) to expected value(s).
 	// Example: {"0": ArgumentConstraint{Value: "0.0.0.0"}}
-	// Position is stored as string key to match JSON format from Python DSL.
+	// Position is stored as string key to match JSON format from Python SDK.
 	// This field is optional and will be omitted from JSON if empty.
 	PositionalArgs map[string]ArgumentConstraint `json:"positionalArgs,omitempty"`
 
@@ -46,6 +74,10 @@ type CallMatcherIR struct {
 	// Example: {"debug": ArgumentConstraint{Value: true}}
 	// This field is optional and will be omitted from JSON if empty.
 	KeywordArgs map[string]ArgumentConstraint `json:"keywordArgs,omitempty"`
+
+	// TrackedParams specifies which parameters are taint-sensitive.
+	// When empty, all parameters are considered sensitive (default).
+	TrackedParams []TrackedParam `json:"trackedParams,omitempty"`
 }
 
 // GetType returns the IR type.
@@ -65,14 +97,29 @@ func (v *VariableMatcherIR) GetType() IRType {
 	return IRTypeVariableMatcher
 }
 
-// DataflowIR represents dataflow (taint analysis) JSON IR from Python DSL.
+// AttributeMatcherIR represents attribute_matcher JSON IR.
+// Matches pure attribute access patterns (not calls) on the RHS of assignments,
+// e.g. {"type": "attribute_matcher", "patterns": ["request.url", "file.filename"]}.
+type AttributeMatcherIR struct {
+	Type     string   `json:"type"`     // "attribute_matcher"
+	Patterns []string `json:"patterns"` // ["request.url", "file.filename"]
+}
+
+// GetType returns the IR type.
+func (a *AttributeMatcherIR) GetType() IRType {
+	return IRTypeAttributeMatcher
+}
+
+// DataflowIR represents dataflow (taint analysis) JSON IR from Python SDK.
+// Sources/Sinks/Sanitizers accept any matcher type (CallMatcherIR or TypeConstrainedCallIR).
 type DataflowIR struct {
-	Type        string           `json:"type"`        // "dataflow"
-	Sources     []CallMatcherIR  `json:"sources"`     // Where taint originates
-	Sinks       []CallMatcherIR  `json:"sinks"`       // Dangerous functions
-	Sanitizers  []CallMatcherIR  `json:"sanitizers"`  // Taint-removing functions
-	Propagation []PropagationIR  `json:"propagation"` // How taint flows (for future use)
-	Scope       string           `json:"scope"`       // "local" or "global"
+	Type        string            `json:"type"`                  // "dataflow"
+	Sources     []json.RawMessage `json:"sources"`               // Any matcher IR
+	Sinks       []json.RawMessage `json:"sinks"`                 // Any matcher IR
+	Sanitizers  []json.RawMessage `json:"sanitizers"`            // Any matcher IR
+	Propagation []PropagationIR   `json:"propagation"`           // How taint flows (for future use)
+	Scope       string            `json:"scope"`                 // "local" or "global"
+	Language    string            `json:"language,omitempty"`     // "go", "python", "" (any)
 }
 
 // GetType returns the IR type.
@@ -82,20 +129,125 @@ func (d *DataflowIR) GetType() IRType {
 
 // PropagationIR represents propagation primitives (currently informational only).
 type PropagationIR struct {
-	Type     string                 `json:"type"`     // "assignment", "function_args", etc.
-	Metadata map[string]interface{} `json:"metadata"` // Future use
+	Type     string         `json:"type"`     // "assignment", "function_args", etc.
+	Metadata map[string]any `json:"metadata"` // Future use
 }
 
 // DataflowDetection represents a detected taint flow.
 type DataflowDetection struct {
-	FunctionFQN string  // Function containing the vulnerability
-	SourceLine  int     // Line where taint originates
-	SinkLine    int     // Line where taint reaches sink
-	TaintedVar  string  // Variable name that is tainted
-	SinkCall    string  // Sink function name
-	Confidence  float64 // 0.0-1.0 confidence score
-	Sanitized   bool    // Was sanitization detected?
-	Scope       string  // "local" or "global"
+	FunctionFQN     string          // Function containing the vulnerability (sink function for cross-file)
+	SourceFunctionFQN string        // Function containing the source (may differ from FunctionFQN for cross-file)
+	SourceLine      int             // Line where taint originates
+	SourceColumn    int             // Column where taint originates
+	SourceFile      string          // File where taint originates (resolved by enricher)
+	SinkLine        int             // Line where taint reaches sink
+	SinkColumn      int             // Column where taint reaches sink
+	SinkFile        string          // File where taint reaches sink (resolved by enricher)
+	TaintedVar      string          // Variable name that is tainted
+	SinkCall        string          // Sink function name
+	Confidence      float64         // 0.0-1.0 confidence score
+	Sanitized       bool            // Was sanitization detected?
+	Scope           string          // "local" or "global"
+	MatchedCallSite *core.CallSite  // Internal: matched call site for DataflowExecutor use
+	MatchMethod     string          // How the match was made: "type_inference", "fqn_bridge", "fqn_prefix", "name_fallback"
+
+	// SinkParamIndex is the positional index of the tainted sink parameter.
+	// nil when parameter position could not be determined.
+	SinkParamIndex *int `json:"sinkParamIndex,omitempty"`
+
+	// SinkParamName is the name of the tainted sink parameter, if known.
+	// Deferred: not populated in v1, reserved for future use.
+	SinkParamName string `json:"sinkParamName,omitempty"`
+}
+
+// TypeConstrainedCallIR represents type_constrained_call JSON IR.
+// Matches call sites where the receiver variable has a specific inferred type.
+//
+//nolint:tagliatelle // JSON tags match Python SDK format.
+type TypeConstrainedCallIR struct {
+	Type             string  `json:"type"`                       // "type_constrained_call"
+	ReceiverType     string  `json:"receiverType,omitempty"`     // backward compat: single FQN
+	ReceiverTypes    []string `json:"receiverTypes,omitempty"`   // multiple exact FQNs
+	ReceiverPatterns []string `json:"receiverPatterns,omitempty"` // wildcard patterns
+	MatchSubclasses  bool    `json:"matchSubclasses"`            // MRO inheritance matching
+	MethodName       string  `json:"methodName,omitempty"`       // backward compat: single method
+	MethodNames      []string `json:"methodNames,omitempty"`     // multiple method names
+	MinConfidence    float64 `json:"minConfidence"`              // default 0.5
+	FallbackMode     string  `json:"fallbackMode"`               // "name", "none"
+
+	// Argument matching (reuses ArgumentConstraint)
+	PositionalArgs map[string]ArgumentConstraint `json:"positionalArgs,omitempty"`
+	KeywordArgs    map[string]ArgumentConstraint `json:"keywordArgs,omitempty"`
+
+	// TrackedParams specifies which parameters are taint-sensitive.
+	// When empty, all parameters are considered sensitive (default).
+	TrackedParams []TrackedParam `json:"trackedParams,omitempty"`
+}
+
+// GetEffectiveReceiverTypes returns the receiver types, merging legacy single field.
+func (t *TypeConstrainedCallIR) GetEffectiveReceiverTypes() []string {
+	types := make([]string, 0, len(t.ReceiverTypes)+1)
+	if t.ReceiverType != "" {
+		types = append(types, t.ReceiverType)
+	}
+	types = append(types, t.ReceiverTypes...)
+	return types
+}
+
+// GetEffectiveMethodNames returns the method names, merging legacy single field.
+func (t *TypeConstrainedCallIR) GetEffectiveMethodNames() []string {
+	names := make([]string, 0, len(t.MethodNames)+1)
+	if t.MethodName != "" {
+		names = append(names, t.MethodName)
+	}
+	names = append(names, t.MethodNames...)
+	return names
+}
+
+// GetType returns the IR type.
+func (t *TypeConstrainedCallIR) GetType() IRType {
+	return IRTypeTypeConstrainedCall
+}
+
+// TypeConstrainedAttributeIR represents type_constrained_attribute JSON IR.
+// Matches attribute access on variables with a specific inferred type.
+//
+//nolint:tagliatelle // JSON tags match Python SDK format.
+type TypeConstrainedAttributeIR struct {
+	Type           string   `json:"type"`                       // "type_constrained_attribute"
+	ReceiverType   string   `json:"receiverType"`               // singular — backward compat
+	ReceiverTypes  []string `json:"receiverTypes,omitempty"`    // plural — from Python SDK
+	AttributeName  string   `json:"attributeName"`              // singular — backward compat
+	AttributeNames []string `json:"attributeNames,omitempty"`   // plural — from Python SDK
+	MinConfidence  float64  `json:"minConfidence"`              // default 0.5
+	FallbackMode   string   `json:"fallbackMode"`               // "name", "none"
+}
+
+// GetType returns the IR type.
+func (t *TypeConstrainedAttributeIR) GetType() IRType {
+	return IRTypeTypeConstrainedAttribute
+}
+
+// getReceiverTypes returns the receiver type list, merging singular and plural fields.
+func (t *TypeConstrainedAttributeIR) getReceiverTypes() []string {
+	if len(t.ReceiverTypes) > 0 {
+		return t.ReceiverTypes
+	}
+	if t.ReceiverType != "" {
+		return []string{t.ReceiverType}
+	}
+	return nil
+}
+
+// getAttributeNames returns the attribute name list, merging singular and plural fields.
+func (t *TypeConstrainedAttributeIR) getAttributeNames() []string {
+	if len(t.AttributeNames) > 0 {
+		return t.AttributeNames
+	}
+	if t.AttributeName != "" {
+		return []string{t.AttributeName}
+	}
+	return nil
 }
 
 // RuleIR represents a complete rule with metadata.
@@ -108,5 +260,5 @@ type RuleIR struct {
 		OWASP       string `json:"owasp"`
 		Description string `json:"description"`
 	} `json:"rule"`
-	Matcher interface{} `json:"matcher"` // Will be one of *MatcherIR types
+	Matcher any `json:"matcher"` // Will be one of *MatcherIR types
 }

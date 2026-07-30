@@ -1,0 +1,54 @@
+id: DOCKER-BP-011
+name: Prefer COPY Over ADD
+short_description: Use COPY instead of ADD for simple file operations. ADD has implicit behavior that
+  can be surprising.
+severity: LOW
+category: best-practice
+language: docker
+ruleset: docker/DOCKER-BP-011
+cwe:
+- id: CWE-710
+  name: Improper Adherence to Coding Standards
+  url: https://cwe.mitre.org/data/definitions/710.html
+tags:
+- docker
+- dockerfile
+- copy
+- add
+- file-operations
+- best-practice
+- transparency
+- predictability
+- anti-pattern
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'Detects use of ADD instruction when COPY would suffice. ADD has implicit behavior
+
+  (auto-extraction of tar archives, URL downloading) that can be surprising and
+
+  create security risks.'
+message: Use COPY instead of ADD for simple file operations. ADD has implicit behavior that can be surprising.
+secure_example: 'COPY app.tar.gz /app/  # ✅ Just copies the file
+
+  RUN tar xzf /app/app.tar.gz  # ✅ Explicit extraction'
+recommendations:
+  - "Use COPY for copying local files into the image"
+  - "Only use ADD when you specifically need tar auto-extraction or URL downloading"
+  - "For downloading files, prefer RUN with curl or wget for better control"
+detection_scope: ''
+references:
+- title: Docker Best Practices
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
+- title: "Dockerfile Best Practice: Use COPY instead of ADD for files"
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#add-or-copy
+compliance: []
+faq:
+  - question: "What is the difference between ADD and COPY?"
+    answer: "COPY simply copies files from the build context. ADD has extra features: it auto-extracts tar archives and can download from URLs. These implicit behaviors can be surprising and introduce security risks."
+  - question: "When should I use ADD?"
+    answer: "Use ADD only when you need automatic tar extraction (e.g., ADD rootfs.tar.xz /). For all other cases, COPY is clearer and safer."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

@@ -42,6 +42,12 @@ func Init(disableMetrics bool) {
 	enableMetrics = !disableMetrics
 }
 
+// IsDisabled reports whether analytics have been disabled by the caller.
+// Use this to gate analytics calls in packages that import analytics.
+func IsDisabled() bool {
+	return !enableMetrics
+}
+
 func SetVersion(version string) {
 	appVersion = version
 }
@@ -85,7 +91,7 @@ func ReportEvent(event string) {
 
 // ReportEventWithProperties sends an event with additional properties.
 // Properties should not contain any PII (no file paths, code, user info).
-func ReportEventWithProperties(event string, properties map[string]interface{}) {
+func ReportEventWithProperties(event string, properties map[string]any) {
 	if enableMetrics && PublicKey != "" {
 		// Enable GeoIP resolution by setting DisableGeoIP to false (pointer to bool)
 		disableGeoIP := false

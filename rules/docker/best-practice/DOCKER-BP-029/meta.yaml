@@ -1,0 +1,59 @@
+id: DOCKER-BP-029
+name: Avoid yum update
+short_description: Avoid 'yum update' in Dockerfiles. Use specific base image versions for reproducible
+  builds.
+severity: MEDIUM
+category: best-practice
+language: docker
+ruleset: docker/DOCKER-BP-029
+cwe:
+- id: CWE-710
+  name: Improper Adherence to Coding Standards
+  url: https://cwe.mitre.org/data/definitions/710.html
+tags:
+- docker
+- dockerfile
+- yum
+- package-manager
+- centos
+- rhel
+- update
+- reproducibility
+- best-practice
+- anti-pattern
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'Detects use of ''yum update'' in Dockerfiles. Running system updates in Docker builds
+
+  creates unpredictable, non-reproducible images and can introduce breaking changes or
+
+  security vulnerabilities.'
+message: Avoid 'yum update' in Dockerfiles. Use specific base image versions for reproducible builds.
+secure_example: 'FROM centos:8  # Specific version
+
+  RUN yum install -y httpd-2.4.37-43.module_el8.5.0
+
+  # Or install latest from specific base image
+
+  RUN yum install -y httpd'
+recommendations:
+  - "Review your Dockerfile to address the avoid yum update issue"
+  - "Follow Docker official best practices for image building"
+  - "Use docker build --check to validate Dockerfile syntax and best practices"
+detection_scope: ''
+references:
+- title: Docker Best Practices
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
+- title: "Dockerfile Best Practice: Avoid apt-get upgrade"
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#apt-get
+compliance: []
+faq:
+  - question: "Why does this rule flag avoid yum update?"
+    answer: "Avoid 'yum update' in Dockerfiles. Use specific base image versions for reproducible builds."
+  - question: "How do I fix this?"
+    answer: "Review the secure code example in the playground above and apply the recommended pattern to your Dockerfile or docker-compose.yml."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

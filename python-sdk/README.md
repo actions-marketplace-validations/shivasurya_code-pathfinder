@@ -1,3 +1,5 @@
+<!-- mcp-name: dev.codepathfinder/pathfinder -->
+
 # Code Pathfinder Python SDK
 
 Write security rules in Python for Code Pathfinder, an open-source security scanner that combines structural code analysis with AI-powered vulnerability detection.
@@ -73,4 +75,4 @@ For detailed documentation, visit https://codepathfinder.dev/
 
 ## License
 
-AGPL-3.0 - GNU Affero General Public License v3
+Apache-2.0 - Apache License, Version 2.0

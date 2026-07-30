@@ -36,7 +36,7 @@ class CLIProfileCommand {
         process.exit(1);
       }
 
-      console.log(cyan('🔍 SecureFlow Workspace Profiler'));
+      console.log(cyan('🔍 Code Pathfinder Workspace Profiler'));
       console.log(`📂 Analyzing project at: ${resolvedPath}`);
       console.log('');
 
@@ -49,7 +49,7 @@ class CLIProfileCommand {
 
       // Create profiler instance
       const profilerOptions = {
-        selectedModel: this.selectedModel || config.model || 'claude-sonnet-4-5-20250929'
+        selectedModel: this.selectedModel || config.model || 'claude-sonnet-4-6'
       };
       const profiler = new CLIProjectProfiler(profilerOptions);
 

@@ -1,0 +1,61 @@
+id: DOCKER-BP-023
+name: Prefer apt-get over apt
+short_description: Use apt-get instead of apt for better script stability in Dockerfiles.
+severity: LOW
+category: best-practice
+language: docker
+ruleset: docker/DOCKER-BP-023
+cwe:
+- id: CWE-710
+  name: Improper Adherence to Coding Standards
+  url: https://cwe.mitre.org/data/definitions/710.html
+tags:
+- docker
+- dockerfile
+- apt
+- apt-get
+- package-manager
+- ubuntu
+- debian
+- scripting
+- stability
+- reproducibility
+- best-practice
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'Detects use of ''apt'' command instead of ''apt-get'' in Dockerfiles.
+
+  The ''apt'' command is designed for interactive use and has an unstable CLI interface
+
+  that may change between versions, making builds less reproducible.'
+message: Use apt-get instead of apt for better script stability in Dockerfiles.
+secure_example: 'FROM ubuntu:22.04
+
+
+  # Good: apt-get has stable CLI for scripting
+
+  RUN apt-get update && apt-get install -y nginx'
+recommendations:
+  - "Use apt-get instead of apt in Dockerfiles for stable CLI behavior"
+  - "Always run apt-get update && apt-get install in the same RUN instruction"
+  - "Add --no-install-recommends to minimize installed packages"
+  - "Clean up with rm -rf /var/lib/apt/lists/* in the same layer"
+detection_scope: ''
+references:
+- title: Docker Best Practices
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
+- title: "Dockerfile Best Practice: Avoid apt instead of apt-get"
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#apt-get
+- title: Debian apt vs apt-get documentation
+  url: https://wiki.debian.org/AptCLI
+compliance: []
+faq:
+  - question: "Why use apt-get instead of apt?"
+    answer: "apt is designed for interactive use and its output format may change between versions. apt-get provides a stable CLI interface suitable for scripting and Dockerfiles."
+  - question: "Why combine update and install in one RUN?"
+    answer: "Docker caches layers. If apt-get update is in a separate RUN, the package index cache may be stale when install runs, causing package-not-found errors."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

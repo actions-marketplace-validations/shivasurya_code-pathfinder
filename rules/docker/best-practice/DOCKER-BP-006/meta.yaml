@@ -1,0 +1,56 @@
+id: DOCKER-BP-006
+name: Avoid apt-get upgrade
+short_description: Avoid apt-get upgrade in Dockerfiles. Use specific base image versions instead.
+severity: MEDIUM
+category: best-practice
+language: docker
+ruleset: docker/DOCKER-BP-006
+cwe:
+- id: CWE-710
+  name: Improper Adherence to Coding Standards
+  url: https://cwe.mitre.org/data/definitions/710.html
+tags:
+- docker
+- dockerfile
+- apt-get
+- upgrade
+- package-manager
+- ubuntu
+- debian
+- reproducibility
+- best-practice
+- anti-pattern
+- build
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'Detects use of `apt-get upgrade` or `apt-get dist-upgrade` in Dockerfiles.
+
+  Running system upgrades in Docker builds creates unpredictable, non-reproducible images
+
+  and can introduce breaking changes or security vulnerabilities.'
+message: Avoid apt-get upgrade in Dockerfiles. Use specific base image versions instead.
+secure_example: 'FROM ubuntu:22.04  # Specific version
+
+  RUN apt-get update && apt-get install -y nginx=1.18.0-0ubuntu1'
+recommendations:
+  - "Use apt-get instead of apt in Dockerfiles for stable CLI behavior"
+  - "Always run apt-get update && apt-get install in the same RUN instruction"
+  - "Add --no-install-recommends to minimize installed packages"
+  - "Clean up with rm -rf /var/lib/apt/lists/* in the same layer"
+detection_scope: ''
+references:
+- title: Docker Best Practices
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
+- title: "Dockerfile Best Practice: Avoid apt-get upgrade"
+  url: https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#apt-get
+compliance: []
+faq:
+  - question: "Why use apt-get instead of apt?"
+    answer: "apt is designed for interactive use and its output format may change between versions. apt-get provides a stable CLI interface suitable for scripting and Dockerfiles."
+  - question: "Why combine update and install in one RUN?"
+    answer: "Docker caches layers. If apt-get update is in a separate RUN, the package index cache may be stale when install runs, causing package-not-found errors."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

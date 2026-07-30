@@ -1,5 +1,5 @@
 """
-codepathfinder - Python DSL for static analysis security patterns
+codepathfinder - Python SDK for static analysis security patterns
 
 Examples:
     Basic matchers:
@@ -22,27 +22,37 @@ Examples:
         ... )
 """
 
-__version__ = "1.3.5"
+__version__ = "2.1.1"
 
-from .matchers import calls, variable
-from .decorators import rule
-from .dataflow import flows
-from .propagation import propagates
-from .presets import PropagationPresets
 from .config import set_default_propagation, set_default_scope
-from .logic import And, Or, Not
+from .dataflow import flows
+from .decorators import rule
+from .logic import And, Not, Or
+from .matchers import attribute, calls, variable
+from .presets import PropagationPresets
+from .propagation import propagates
+from .qualifiers import gt, gte, lt, lte, missing, regex
+from .query_type import QueryType
 
 __all__ = [
-    "calls",
-    "variable",
-    "rule",
-    "flows",
-    "propagates",
+    "And",
+    "Not",
+    "Or",
     "PropagationPresets",
+    "QueryType",
+    "__version__",
+    "attribute",
+    "calls",
+    "flows",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "missing",
+    "propagates",
+    "regex",
+    "rule",
     "set_default_propagation",
     "set_default_scope",
-    "And",
-    "Or",
-    "Not",
-    "__version__",
+    "variable",
 ]

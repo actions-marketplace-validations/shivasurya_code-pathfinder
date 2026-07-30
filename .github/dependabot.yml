@@ -1,0 +1,145 @@
+# Dependabot configuration: security-only.
+#
+# What this enables:
+#   - Dependabot security updates: PRs opened automatically when a tracked
+#     manifest contains a dependency with a published advisory. Triggered
+#     by Dependabot alerts; not subject to schedule or open-pr-limit.
+#
+# What this disables:
+#   - Routine "bump axios from 1.2.3 to 1.2.4" version-bump PRs. Each
+#     ecosystem below sets open-pull-requests-limit: 0, which the GitHub
+#     docs document as the supported way to keep an ecosystem registered
+#     for security updates while suppressing every version-update PR.
+#
+# Why security-only:
+#   Supply-chain attacks via npm/PyPI/Go modules have become routine
+#   (chained typosquats, post-install scripts, account takeovers of
+#   maintainer accounts). A constant stream of merge-this-patch-bump PRs
+#   produces alert fatigue and tempts a quick rubber-stamp on a malicious
+#   release. Reserving Dependabot's noise budget for actual CVEs keeps
+#   reviewer attention where it matters.
+#
+# Why the explicit allowlist still matters:
+#   Without the seven entries below, Dependabot's auto-discovery would
+#   also track the ~70 go.mod files under rules/**/tests/ and
+#   sast-engine/test-fixtures/, which pin deliberately vulnerable
+#   versions (dgrijalva/jwt-go@v3.2.0 for GO-JWT-002, vulnerable gorm
+#   releases for GO-GORM-SQLI-*, etc.). Letting Dependabot file
+#   "security updates" against those would silently break the rules
+#   they exist to test. The allowlist scopes BOTH version AND security
+#   updates to the seven real manifest locations.
+#
+# Severity filtering (high/critical only):
+#   open-pull-requests-limit cannot filter by severity. To suppress
+#   medium/low security update PRs, add auto-triage rules under
+#   Settings -> Security -> Dependabot -> Auto-triage rules with
+#   action = "Auto-dismiss alert", filter on severity <= medium. Those
+#   rules also dismiss the underlying alerts from the Security tab,
+#   keeping the queue focused on what actually merits a hotfix.
+
+version: 2
+
+updates:
+  # --- Go ---
+
+  - package-ecosystem: "gomod"
+    directory: "/sast-engine"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "go"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/sast-engine/tools/validate_go_resolution"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "go"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # --- Java (Gradle) ---
+
+  - package-ecosystem: "gradle"
+    directory: "/sast-engine"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # --- Python ---
+
+  - package-ecosystem: "pip"
+    directory: "/python-sdk"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "python"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "pip"
+    directory: "/sast-engine/tools/typeshed-converter"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "python"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # --- npm (VS Code extension monorepo) ---
+
+  - package-ecosystem: "npm"
+    directory: "/extension/secureflow"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "npm"
+    directory: "/extension/secureflow/packages/secureflow-cli"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # --- GitHub Actions ---
+  # Tracks SHA-pinned action references across .github/workflows/*.yml.
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependencies"
+      - "github_actions"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"

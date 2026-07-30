@@ -17,6 +17,7 @@ import (
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/builder"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/registry"
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/resolution"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/docker"
 	"github.com/shivasurya/code-pathfinder/sast-engine/output"
 	"github.com/shivasurya/code-pathfinder/sast-engine/ruleset"
@@ -25,8 +26,8 @@ import (
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
-	Short: "Scan code for security vulnerabilities using Python DSL rules",
-	Long: `Scan codebase using Python DSL security rules.
+	Short: "Scan code for security vulnerabilities using Python SDK rules",
+	Long: `Scan codebase using Python SDK security rules.
 
 Examples:
   # Scan with a single rules file
@@ -67,12 +68,14 @@ Examples:
 		outputFormat, _ := cmd.Flags().GetString("output")
 		outputFile, _ := cmd.Flags().GetString("output-file")
 		skipTests, _ := cmd.Flags().GetBool("skip-tests")
+		rawExcludes, _ := cmd.Flags().GetStringArray("exclude")
+		rawDisableRules, _ := cmd.Flags().GetStringArray("disable-rule")
 		diffAware, _ := cmd.Flags().GetBool("diff-aware")
 		baseRef, _ := cmd.Flags().GetString("base")
 		headRef, _ := cmd.Flags().GetString("head")
 
 		// Track scan started event (no PII, just metadata)
-		analytics.ReportEventWithProperties(analytics.ScanStarted, map[string]interface{}{
+		analytics.ReportEventWithProperties(analytics.ScanStarted, map[string]any{
 			"output_format":     outputFormat,
 			"has_local_rules":   rulesPath != "",
 			"has_remote_rules":  len(rulesetSpecs) > 0,
@@ -82,7 +85,7 @@ Examples:
 
 		// Validate that at least one rule source is provided
 		if len(rulesetSpecs) == 0 && rulesPath == "" {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "validation",
 				"phase":      "initialization",
 			})
@@ -90,11 +93,21 @@ Examples:
 		}
 
 		if projectPath == "" {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "validation",
 				"phase":      "initialization",
 			})
 			return fmt.Errorf("--project flag is required")
+		}
+
+		excludes, err := validateExcludePatterns(rawExcludes)
+		if err != nil {
+			return err
+		}
+
+		disabledRules, err := validateDisableRules(rawDisableRules)
+		if err != nil {
+			return err
 		}
 
 		// Setup logger with appropriate verbosity
@@ -125,7 +138,7 @@ Examples:
 		// Handle remote ruleset downloads and merge with local rules
 		finalRulesPath, tempDir, err := prepareRules(rulesPath, rulesetSpecs, refreshRules, logger)
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "rule_preparation",
 				"phase":      "initialization",
 			})
@@ -182,16 +195,20 @@ Examples:
 			OnProgress: func() {
 				logger.UpdateProgress(1)
 			},
+			ExcludePatterns: excludes,
 		})
 		logger.FinishProgress()
 		if len(codeGraph.Nodes) == 0 {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
-				"error_type": "empty_project",
-				"phase":      "graph_building",
-			})
-			return fmt.Errorf("no source files found in project")
+			// No supported source under projectPath. Fall through to the
+			// formatter step so a valid (empty) output document is still
+			// written: downstream consumers like cpf-executor read the
+			// JSON regardless of finding count, and treating this as a
+			// hard error misclassifies "repo we don't analyze yet" as a
+			// scanner failure.
+			reportEmptyProject(logger, codeGraph.ProjectStats)
+		} else {
+			logger.Statistic("Code graph built: %d nodes", len(codeGraph.Nodes))
 		}
-		logger.Statistic("Code graph built: %d nodes", len(codeGraph.Nodes))
 
 		// Step 1.5: Execute container rules if Docker/Compose files are present
 		var containerDetections []*dsl.EnrichedDetection
@@ -234,7 +251,7 @@ Examples:
 		cg, err := builder.BuildCallGraph(codeGraph, moduleRegistry, projectPath, logger)
 		logger.FinishProgress()
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "callgraph_build",
 				"phase":      "graph_building",
 			})
@@ -243,12 +260,58 @@ Examples:
 		logger.Statistic("Callgraph built: %d functions, %d call sites",
 			len(cg.Functions), countTotalCallSites(cg))
 
-		// Step 4: Load Python DSL rules
+		// Build Go call graph if go.mod exists
+		goModPath := filepath.Join(projectPath, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			logger.Debug("Detected go.mod, building Go call graph...")
+
+			goRegistry, err := resolution.BuildGoModuleRegistry(projectPath)
+			if err != nil {
+				logger.Warning("Failed to build Go module registry: %v", err)
+			} else {
+				// Initialize Go stdlib loader and type inference engine
+				builder.InitGoStdlibLoader(goRegistry, projectPath, logger)
+
+				// Initialize Go third-party type loader (vendor/ + GOMODCACHE).
+				// Pass refreshRules so --refresh-rules also flushes the go-thirdparty disk cache.
+				builder.InitGoThirdPartyLoader(goRegistry, projectPath, refreshRules, logger)
+
+				goTypeEngine := resolution.NewGoTypeInferenceEngine(goRegistry)
+
+				enableDBCache, _ := cmd.Flags().GetBool("enable-db-cache")
+				var analysisCache *builder.AnalysisCache
+				if enableDBCache {
+					var cacheErr error
+					analysisCache, cacheErr = builder.OpenAnalysisCache(projectPath)
+					if cacheErr != nil {
+						logger.Warning("Could not open analysis cache: %v — running full analysis", cacheErr)
+					} else {
+						defer analysisCache.Close()
+					}
+				}
+
+				goCG, err := builder.BuildGoCallGraph(codeGraph, goRegistry, goTypeEngine, logger, analysisCache)
+				if err != nil {
+					logger.Warning("Failed to build Go call graph: %v", err)
+				} else {
+					if analysisCache != nil {
+						logger.Progress("Cache: incremental analysis cache updated")
+					}
+					builder.MergeCallGraphs(cg, goCG)
+					logger.Statistic("Go call graph merged: %d functions, %d call sites",
+						len(goCG.Functions), countTotalCallSites(goCG))
+				}
+			}
+		}
+
+		buildClikeCallGraphs(cg, codeGraph, projectPath, logger)
+
+		// Step 4: Load Python SDK rules
 		logger.StartProgress("Loading rules", -1)
 		rules, err := loader.LoadRules(logger)
 		logger.FinishProgress()
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "rule_loading",
 				"phase":      "rule_loading",
 			})
@@ -256,9 +319,32 @@ Examples:
 		}
 		logger.Statistic("Loaded %d rules", len(rules))
 
+		// Apply --disable-rule. Mirrors --exclude: cheap up-front filter on the
+		// rule slice before any matcher work runs. Rule IDs are matched
+		// case-sensitively because the loader emits them verbatim.
+		if len(disabledRules) > 0 {
+			disabledSet := make(map[string]struct{}, len(disabledRules))
+			for _, id := range disabledRules {
+				disabledSet[id] = struct{}{}
+			}
+			kept := rules[:0]
+			skipped := 0
+			for _, r := range rules {
+				if _, drop := disabledSet[r.Rule.ID]; drop {
+					skipped++
+					continue
+				}
+				kept = append(kept, r)
+			}
+			rules = kept
+			if skipped > 0 {
+				logger.Statistic("Disabled %d rules via --disable-rule", skipped)
+			}
+		}
+
 		// Validate that at least one type of rule was loaded
 		if len(rules) == 0 && len(containerDetections) == 0 {
-			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.ScanFailed, map[string]any{
 				"error_type": "no_rules",
 				"phase":      "rule_loading",
 			})
@@ -299,11 +385,14 @@ Examples:
 		// Merge container detections with code analysis detections
 		allEnriched = append(allEnriched, containerDetections...)
 
-		// Apply diff filter when diff-aware mode is active.
-		if diffAware && len(changedFiles) > 0 {
-			totalBefore := len(allEnriched)
-			diffFilter := output.NewDiffFilter(changedFiles)
-			allEnriched = diffFilter.Filter(allEnriched)
+		// Apply diff filter when diff-aware mode is active. Shared with
+		// cmd/ci.go via applyDiffFilter to keep the empty-diff contract
+		// (return zero findings, do NOT fall back to a full scan) honoured
+		// in both commands. See cmd/diff_filter.go for the rationale.
+		totalBefore := len(allEnriched)
+		var filterApplied bool
+		allEnriched, filterApplied = applyDiffFilter(allEnriched, changedFiles, diffAware)
+		if filterApplied {
 			logger.Progress("Diff filter: %d/%d findings in changed files", len(allEnriched), totalBefore)
 		}
 
@@ -402,19 +491,19 @@ Examples:
 			severityBreakdown[det.Rule.Severity]++
 		}
 
-		analytics.ReportEventWithProperties(analytics.ScanCompleted, map[string]interface{}{
-			"duration_ms":         time.Since(startTime).Milliseconds(),
-			"rules_count":         len(uniqueRules),
-			"findings_count":      len(allEnriched),
-			"diff_aware":          diffAware,
-			"diff_changed_files":  len(changedFiles),
-			"severity_critical": severityBreakdown["critical"],
-			"severity_high":     severityBreakdown["high"],
-			"severity_medium":   severityBreakdown["medium"],
-			"severity_low":      severityBreakdown["low"],
-			"output_format":     outputFormat,
-			"exit_code":         int(exitCode),
-			"had_errors":        scanErrors,
+		analytics.ReportEventWithProperties(analytics.ScanCompleted, map[string]any{
+			"duration_ms":        time.Since(startTime).Milliseconds(),
+			"rules_count":        len(uniqueRules),
+			"findings_count":     len(allEnriched),
+			"diff_aware":         diffAware,
+			"diff_changed_files": len(changedFiles),
+			"severity_critical":  severityBreakdown["critical"],
+			"severity_high":      severityBreakdown["high"],
+			"severity_medium":    severityBreakdown["medium"],
+			"severity_low":       severityBreakdown["low"],
+			"output_format":      outputFormat,
+			"exit_code":          int(exitCode),
+			"had_errors":         scanErrors,
 		})
 
 		if exitCode != output.ExitCodeSuccess {
@@ -431,6 +520,72 @@ func countTotalCallSites(cg *core.CallGraph) int {
 		total += len(sites)
 	}
 	return total
+}
+
+// buildClikeCallGraphs runs the C and C++ call-graph builders against
+// codeGraph (when those languages are present) and merges the results
+// into cg. Each builder is independent: a failure or skip on one
+// language never blocks the other.
+//
+// Unlike Go (which checks `go.mod` up front), C/C++ has no single
+// manifest file. We instead look at the already-parsed CodeGraph for
+// nodes tagged with the right `Language` so the builder skips the
+// work entirely on Python-only or Go-only projects.
+func buildClikeCallGraphs(cg *core.CallGraph, codeGraph *graph.CodeGraph, projectPath string, logger *output.Logger) {
+	if hasLanguageNodes(codeGraph, "c") {
+		buildCCallGraphAndMerge(cg, codeGraph, projectPath, logger)
+	}
+	if hasLanguageNodes(codeGraph, "cpp") {
+		buildCppCallGraphAndMerge(cg, codeGraph, projectPath, logger)
+	}
+}
+
+// buildCCallGraphAndMerge constructs the C call graph and merges it
+// into cg. Build failures emit a warning and leave cg untouched.
+func buildCCallGraphAndMerge(cg *core.CallGraph, codeGraph *graph.CodeGraph, projectPath string, logger *output.Logger) {
+	logger.Debug("Detected C source files, building C call graph...")
+	cRegistry := registry.BuildCModuleRegistry(projectPath, codeGraph)
+	cTypeEngine := resolution.NewCTypeInferenceEngine(cRegistry)
+	cCG, err := builder.BuildCCallGraph(codeGraph, cRegistry, cTypeEngine)
+	if err != nil {
+		logger.Warning("Failed to build C call graph: %v", err)
+		return
+	}
+	builder.MergeCallGraphs(cg, cCG)
+	logger.Statistic("C call graph merged: %d functions, %d call sites",
+		len(cCG.Functions), countTotalCallSites(cCG))
+}
+
+// buildCppCallGraphAndMerge constructs the C++ call graph and merges
+// it into cg. Build failures emit a warning and leave cg untouched.
+func buildCppCallGraphAndMerge(cg *core.CallGraph, codeGraph *graph.CodeGraph, projectPath string, logger *output.Logger) {
+	logger.Debug("Detected C++ source files, building C++ call graph...")
+	cppRegistry := registry.BuildCppModuleRegistry(projectPath, codeGraph)
+	cppTypeEngine := resolution.NewCppTypeInferenceEngine(cppRegistry)
+	cppCG, err := builder.BuildCppCallGraph(codeGraph, cppRegistry, cppTypeEngine)
+	if err != nil {
+		logger.Warning("Failed to build C++ call graph: %v", err)
+		return
+	}
+	builder.MergeCallGraphs(cg, cppCG)
+	logger.Statistic("C++ call graph merged: %d functions, %d call sites",
+		len(cppCG.Functions), countTotalCallSites(cppCG))
+}
+
+// hasLanguageNodes reports whether codeGraph contains at least one
+// node tagged with the given Language. Used to gate per-language call
+// graph builders so we skip the work when no source files of that
+// language were parsed.
+func hasLanguageNodes(codeGraph *graph.CodeGraph, language string) bool {
+	if codeGraph == nil {
+		return false
+	}
+	for _, node := range codeGraph.Nodes {
+		if node != nil && node.Language == language {
+			return true
+		}
+	}
+	return false
 }
 
 // extractContainerFiles extracts unique Docker and docker-compose file paths from CodeGraph.
@@ -577,14 +732,8 @@ func generateCodeSnippet(filePath string, lineNumber int, contextLines int) dsl.
 	}
 
 	// Calculate start and end lines (1-indexed)
-	startLine := lineNumber - contextLines
-	if startLine < 1 {
-		startLine = 1
-	}
-	endLine := lineNumber + contextLines
-	if endLine > len(lines) {
-		endLine = len(lines)
-	}
+	startLine := max(lineNumber-contextLines, 1)
+	endLine := min(lineNumber+contextLines, len(lines))
 
 	// Build snippet lines
 	var snippetLines []dsl.SnippetLine
@@ -653,9 +802,9 @@ func printDetections(rule dsl.RuleIR, detections []dsl.DataflowDetection) {
 func findRulesDirectory() string {
 	// Check common locations
 	candidates := []string{
-		"rules",           // Current directory
-		"../rules",        // Parent directory
-		"../../rules",     // Grandparent
+		"rules",       // Current directory
+		"../rules",    // Parent directory
+		"../../rules", // Grandparent
 		filepath.Join(os.Getenv("HOME"), ".local", "share", "code-pathfinder", "rules"),
 		"/usr/local/share/code-pathfinder/rules",
 		"/opt/code-pathfinder/rules",
@@ -743,10 +892,15 @@ func prepareRules(localRulesPath string, rulesetSpecs []string, refresh bool, lo
 	}
 
 	// Resolve individual rule IDs to file paths
+	// First try local rules directory, then fall back to CDN download
 	var resolvedRulePaths []string
 	if len(ruleIDSpecs) > 0 {
 		rulesBaseDir := findRulesDirectory()
 		finder := ruleset.NewRuleFinder(rulesBaseDir)
+
+		// Track which languages need CDN download for unresolved rules
+		unresolvedByLanguage := make(map[string][]string) // language -> list of specs
+		cdnDownloadedDirs := make(map[string]string)      // language -> downloaded dir path
 
 		for _, spec := range ruleIDSpecs {
 			ruleSpec, err := ruleset.ParseRuleSpec(spec)
@@ -758,13 +912,66 @@ func prepareRules(localRulesPath string, rulesetSpecs []string, refresh bool, lo
 				return "", "", fmt.Errorf("invalid rule spec %s: %w", spec, err)
 			}
 
+			// Try local first
 			filePath, err := finder.FindRuleFile(ruleSpec)
-			if err != nil {
-				return "", "", fmt.Errorf("failed to find rule %s: %w", spec, err)
+			if err == nil {
+				resolvedRulePaths = append(resolvedRulePaths, filePath)
+				logger.Progress("Resolved rule %s → %s (local)", spec, filepath.Base(filePath))
+				continue
 			}
 
-			resolvedRulePaths = append(resolvedRulePaths, filePath)
-			logger.Progress("Resolved rule %s → %s", spec, filepath.Base(filePath))
+			// Local not found — queue for CDN download
+			unresolvedByLanguage[ruleSpec.Language] = append(unresolvedByLanguage[ruleSpec.Language], spec)
+		}
+
+		// Download bundles from CDN for unresolved rules
+		if len(unresolvedByLanguage) > 0 {
+			config := &ruleset.DownloadConfig{
+				BaseURL:       "https://assets.codepathfinder.dev/rules",
+				CacheDir:      getCacheDir(),
+				CacheTTL:      24 * time.Hour,
+				ManifestTTL:   1 * time.Hour,
+				HTTPTimeout:   30 * time.Second,
+				RetryAttempts: 3,
+			}
+
+			downloader, err := ruleset.NewDownloader(config)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to create downloader: %w", err)
+			}
+
+			manifestLoader := ruleset.NewManifestLoader(config.BaseURL, config.CacheDir)
+
+			for language, specs := range unresolvedByLanguage {
+				// Download all bundles for this language
+				allSpec := fmt.Sprintf("%s/all", language)
+				expanded, err := expandBundleSpecs([]string{allSpec}, manifestLoader, logger)
+				if err != nil {
+					return "", "", fmt.Errorf("failed to expand %s: %w", allSpec, err)
+				}
+
+				// Download each bundle and collect paths
+				for _, bundleSpec := range expanded {
+					path, err := downloader.Download(bundleSpec)
+					if err != nil {
+						logger.Warning("Failed to download %s: %v", bundleSpec, err)
+						continue
+					}
+					cdnDownloadedDirs[language] = path
+				}
+
+				// Now search for each rule in the downloaded bundles
+				cdnFinder := ruleset.NewRuleFinder(getCacheDir())
+				for _, spec := range specs {
+					ruleSpec, _ := ruleset.ParseRuleSpec(spec)
+					filePath, err := cdnFinder.FindRuleFile(ruleSpec)
+					if err != nil {
+						return "", "", fmt.Errorf("failed to find rule %s (checked local and CDN): %w", spec, err)
+					}
+					resolvedRulePaths = append(resolvedRulePaths, filePath)
+					logger.Progress("Resolved rule %s → %s (CDN)", spec, filepath.Base(filePath))
+				}
+			}
 		}
 	}
 
@@ -957,7 +1164,7 @@ func getCacheDir() string {
 
 func init() {
 	rootCmd.AddCommand(scanCmd)
-	scanCmd.Flags().StringP("rules", "r", "", "Path to Python DSL rules file or directory")
+	scanCmd.Flags().StringP("rules", "r", "", "Path to Python SDK rules file or directory")
 	scanCmd.Flags().StringArray("ruleset", []string{}, "Ruleset bundle (e.g., docker/security) or individual rule ID (e.g., docker/DOCKER-BP-007). Can be specified multiple times.")
 	scanCmd.Flags().Bool("refresh-rules", false, "Force refresh of cached rulesets")
 	scanCmd.Flags().StringP("project", "p", "", "Path to project directory to scan (required)")
@@ -967,8 +1174,11 @@ func init() {
 	scanCmd.Flags().Bool("debug", false, "Show detailed debug diagnostics with file-level progress and timestamps")
 	scanCmd.Flags().String("fail-on", "", "Fail with exit code 1 if findings match severities (e.g., critical,high)")
 	scanCmd.Flags().Bool("skip-tests", true, "Skip test files (test_*.py, *_test.py, conftest.py, etc.)")
+	scanCmd.Flags().StringArray("exclude", nil, "Exclude files or directories from the scan. Repo-relative path prefix; repeatable. e.g. --exclude rules/ --exclude sast-engine/test-fixtures")
+	scanCmd.Flags().StringArray("disable-rule", nil, "Disable a rule by ID; repeatable. e.g. --disable-rule SAST-CMD-001 --disable-rule GO-SSRF-001. IDs must match [A-Za-z0-9_-]{1,64}.")
 	scanCmd.Flags().Bool("diff-aware", false, "Enable diff-aware scanning (only report findings in changed files)")
 	scanCmd.Flags().String("base", "", "Base git ref for diff-aware scanning (required with --diff-aware)")
 	scanCmd.Flags().String("head", "HEAD", "Head git ref for diff-aware scanning")
+	scanCmd.Flags().Bool("enable-db-cache", false, "Enable SQLite-backed incremental analysis cache (experimental)")
 	scanCmd.MarkFlagRequired("project")
 }

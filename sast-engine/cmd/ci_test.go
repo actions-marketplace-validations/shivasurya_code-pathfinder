@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -369,4 +371,154 @@ func TestCICmdPrepareRulesLocalOnly(t *testing.T) {
 	// Verify output was written (proves prepareRules succeeded and pipeline completed)
 	_, err = os.Stat(outputFile)
 	require.NoError(t, err)
+}
+
+// TestCICmdEnableDBCacheFlag verifies that the --enable-db-cache flag is
+// registered on the ci command with the correct default value.
+func TestCICmdEnableDBCacheFlag(t *testing.T) {
+	flag := ciCmd.Flags().Lookup("enable-db-cache")
+	require.NotNil(t, flag, "enable-db-cache flag should be registered on ci command")
+	assert.Equal(t, "false", flag.DefValue)
+}
+
+// TestCICmdEnableDBCacheWithGoProject verifies the --enable-db-cache code path
+// is exercised when running the ci command against a Go project.
+func TestCICmdEnableDBCacheWithGoProject(t *testing.T) {
+	projectDir, rulesFile := setupCIIntegrationTest(t)
+
+	// Add a go.mod so the ci command enters the Go analysis branch.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(projectDir, "go.mod"),
+		[]byte("module example.com/test\n\ngo 1.21\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(projectDir, "main.go"),
+		[]byte("package main\n\nfunc main() {}\n"),
+		0o644,
+	))
+
+	outputFile := filepath.Join(t.TempDir(), "results.sarif")
+
+	resetCIFlags()
+	ciCmd.Flags().Set("rules", rulesFile)
+	ciCmd.Flags().Set("project", projectDir)
+	ciCmd.Flags().Set("output-file", outputFile)
+	require.NoError(t, ciCmd.Flags().Set("enable-db-cache", "true"))
+	defer ciCmd.Flags().Set("enable-db-cache", "false")
+
+	// Should complete without error — the cache is created and closed.
+	err := ciCmd.RunE(ciCmd, []string{})
+	require.NoError(t, err)
+}
+
+// TestCICmdEnableDBCacheOpenError verifies that when OpenAnalysisCache fails
+// (e.g. the cache directory is blocked), the ci command logs a warning and
+// continues without error, covering ci.go lines 289-291.
+func TestCICmdEnableDBCacheOpenError(t *testing.T) {
+	projectDir, rulesFile := setupCIIntegrationTest(t)
+
+	// Add a go.mod so the ci command enters the Go analysis branch.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(projectDir, "go.mod"),
+		[]byte("module example.com/test\n\ngo 1.21\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(projectDir, "main.go"),
+		[]byte("package main\n\nfunc main() {}\n"),
+		0o644,
+	))
+
+	// Block the pathfinder cache directory by placing a regular file where the
+	// cache directory would be created, forcing MkdirAll to fail.
+	fakeCache := t.TempDir()
+	blockFile := filepath.Join(fakeCache, "pathfinder")
+	require.NoError(t, os.WriteFile(blockFile, []byte("block"), 0o444))
+	t.Setenv("XDG_CACHE_HOME", fakeCache)
+
+	outputFile := filepath.Join(t.TempDir(), "results.sarif")
+
+	resetCIFlags()
+	ciCmd.Flags().Set("rules", rulesFile)
+	ciCmd.Flags().Set("project", projectDir)
+	ciCmd.Flags().Set("output-file", outputFile)
+	require.NoError(t, ciCmd.Flags().Set("enable-db-cache", "true"))
+	defer ciCmd.Flags().Set("enable-db-cache", "false")
+
+	// Should warn about cache failure but continue without error.
+	err := ciCmd.RunE(ciCmd, []string{})
+	require.NoError(t, err)
+}
+
+// setCIExcludeFlag replaces (not appends) the StringArray exclude flag on ciCmd.
+// pflag's StringArray.Set appends after the first call; Replace resets cleanly.
+func setCIExcludeFlag(cmd *cobra.Command, values []string) {
+	flag := cmd.Flags().Lookup("exclude")
+	if sv, ok := flag.Value.(pflag.SliceValue); ok {
+		sv.Replace(values)
+		flag.Changed = len(values) > 0
+	}
+}
+
+// TestCICmdExcludeFlag verifies --exclude flag registration and validation.
+func TestCICmdExcludeFlag(t *testing.T) {
+	t.Run("flag is registered", func(t *testing.T) {
+		flag := ciCmd.Flags().Lookup("exclude")
+		require.NotNil(t, flag, "exclude flag should be registered on ci command")
+	})
+
+	// resetForExclude puts the command in a state where RunE reaches validateExcludePatterns.
+	resetForExclude := func(t *testing.T) {
+		t.Helper()
+		ciCmd.Flags().Set("rules", "/tmp/fake-rules.py")
+		ciCmd.Flags().Set("project", "/tmp/fake-project")
+		ciCmd.Flags().Set("output", "sarif")
+		ciCmd.Flags().Set("output-file", "")
+		ciCmd.Flags().Set("verbose", "false")
+		ciCmd.Flags().Set("debug", "false")
+		ciCmd.Flags().Set("fail-on", "")
+		ciCmd.Flags().Set("skip-tests", "true")
+		ciCmd.Flags().Set("no-diff", "true")
+		ciCmd.Flags().Set("base", "")
+		ciCmd.Flags().Set("head", "HEAD")
+		ciCmd.Flags().Set("ruleset", "")
+		ciCmd.Flags().Set("github-token", "")
+		ciCmd.Flags().Set("github-repo", "")
+		ciCmd.Flags().Set("github-pr", "0")
+		ciCmd.Flags().Set("pr-comment", "false")
+		ciCmd.Flags().Set("pr-inline", "false")
+		ciCmd.Flags().Set("enable-db-cache", "false")
+		setCIExcludeFlag(ciCmd, nil) // clear exclude before each test
+	}
+
+	t.Run("absolute pattern rejected", func(t *testing.T) {
+		resetForExclude(t)
+		setCIExcludeFlag(ciCmd, []string{"/etc/passwd"})
+		defer setCIExcludeFlag(ciCmd, nil)
+
+		err := ciCmd.RunE(ciCmd, []string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no leading slash")
+	})
+
+	t.Run("traversal pattern rejected", func(t *testing.T) {
+		resetForExclude(t)
+		setCIExcludeFlag(ciCmd, []string{"../outside"})
+		defer setCIExcludeFlag(ciCmd, nil)
+
+		err := ciCmd.RunE(ciCmd, []string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "..")
+	})
+
+	t.Run("backslash pattern rejected", func(t *testing.T) {
+		resetForExclude(t)
+		setCIExcludeFlag(ciCmd, []string{"foo\\bar"})
+		defer setCIExcludeFlag(ciCmd, nil)
+
+		err := ciCmd.RunE(ciCmd, []string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "backslash")
+	})
 }

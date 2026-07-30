@@ -47,8 +47,12 @@ func (f *SARIFFormatter) Format(detections []*dsl.EnrichedDetection, scanInfo Sc
 	// Build rules from unique rule IDs
 	f.buildRules(detections, run)
 
-	// Build results
+	// Build results — skip detections with no resolvable file path since
+	// GitHub Code Scanning requires every result to have at least one location.
 	for _, det := range detections {
+		if det.Location.RelPath == "" && det.Location.FilePath == "" {
+			continue
+		}
 		f.buildResult(det, run)
 	}
 
@@ -98,20 +102,21 @@ func (f *SARIFFormatter) buildRules(detections []*dsl.EnrichedDetection, run *sa
 }
 
 func (f *SARIFFormatter) buildHelpMarkdown(rule dsl.RuleMetadata) string {
-	markdown := "## " + rule.Name + "\n\n"
+	var markdown strings.Builder
+	markdown.WriteString("## " + rule.Name + "\n\n")
 	if rule.Description != "" {
-		markdown += rule.Description + "\n\n"
+		markdown.WriteString(rule.Description + "\n\n")
 	}
 
 	if len(rule.CWE) > 0 {
-		markdown += "### References\n\n"
+		markdown.WriteString("### References\n\n")
 		for _, cwe := range rule.CWE {
 			cweNum := extractCWENumber(cwe)
-			markdown += "- [" + cwe + "](https://cwe.mitre.org/data/definitions/" + cweNum + ".html)\n"
+			markdown.WriteString("- [" + cwe + "](https://cwe.mitre.org/data/definitions/" + cweNum + ".html)\n")
 		}
 	}
 
-	return markdown
+	return markdown.String()
 }
 
 func extractCWENumber(cwe string) string {
@@ -135,8 +140,8 @@ func (f *SARIFFormatter) severityToLevelString(severity string) string {
 	}
 }
 
-func (f *SARIFFormatter) buildRuleProperties(rule dsl.RuleMetadata) map[string]interface{} {
-	props := make(map[string]interface{})
+func (f *SARIFFormatter) buildRuleProperties(rule dsl.RuleMetadata) map[string]any {
+	props := make(map[string]any)
 
 	// Tags for filtering
 	props["tags"] = []string{"security"}
@@ -189,6 +194,12 @@ func (f *SARIFFormatter) addLocation(det *dsl.EnrichedDetection, result *sarif.R
 		filePath = det.Location.FilePath
 	}
 
+	// Skip adding location if file path is empty — SARIF results with empty
+	// artifact URIs are rejected by GitHub Code Scanning.
+	if filePath == "" {
+		return
+	}
+
 	region := sarif.NewRegion().
 		WithStartLine(det.Location.Line)
 
@@ -218,6 +229,11 @@ func (f *SARIFFormatter) addCodeFlow(det *dsl.EnrichedDetection, result *sarif.R
 		filePath = det.Location.FilePath
 	}
 
+	// Skip code flow if file path is empty — empty artifact URIs are invalid SARIF.
+	if filePath == "" {
+		return
+	}
+
 	// Create thread flow locations
 	sourceMsg := "Taint source"
 	if det.Detection.TaintedVar != "" {
@@ -229,10 +245,19 @@ func (f *SARIFFormatter) addCodeFlow(det *dsl.EnrichedDetection, result *sarif.R
 		sinkMsg += ": " + det.Detection.SinkCall
 	}
 
+	sourceFilePath := filePath
+	if det.Detection.SourceFile != "" {
+		sourceFilePath = det.Detection.SourceFile
+	}
+	sinkFilePath := filePath
+	if det.Detection.SinkFile != "" {
+		sinkFilePath = det.Detection.SinkFile
+	}
+
 	sourceLocation := sarif.NewLocation().
 		WithPhysicalLocation(
 			sarif.NewPhysicalLocation().
-				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(filePath)).
+				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(sourceFilePath)).
 				WithRegion(sarif.NewRegion().WithStartLine(det.Detection.SourceLine)),
 		).
 		WithMessage(sarif.NewTextMessage(sourceMsg))
@@ -240,7 +265,7 @@ func (f *SARIFFormatter) addCodeFlow(det *dsl.EnrichedDetection, result *sarif.R
 	sinkLocation := sarif.NewLocation().
 		WithPhysicalLocation(
 			sarif.NewPhysicalLocation().
-				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(filePath)).
+				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(sinkFilePath)).
 				WithRegion(sarif.NewRegion().WithStartLine(det.Detection.SinkLine)),
 		).
 		WithMessage(sarif.NewTextMessage(sinkMsg))
@@ -262,7 +287,7 @@ func (f *SARIFFormatter) addCodeFlow(det *dsl.EnrichedDetection, result *sarif.R
 	relatedLocation := sarif.NewLocation().
 		WithPhysicalLocation(
 			sarif.NewPhysicalLocation().
-				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(filePath)).
+				WithArtifactLocation(sarif.NewArtifactLocation().WithUri(sourceFilePath)).
 				WithRegion(sarif.NewRegion().WithStartLine(det.Detection.SourceLine)),
 		).
 		WithMessage(sarif.NewTextMessage(sourceMsg))

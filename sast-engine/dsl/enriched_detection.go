@@ -9,8 +9,14 @@ type EnrichedDetection struct {
 	// Resolved location information
 	Location LocationInfo
 
-	// Code snippet with context
+	// Code snippet with context (sink location)
 	Snippet CodeSnippet
+
+	// Source snippet for inter-procedural taint flows (empty for local/pattern)
+	SourceSnippet CodeSnippet
+
+	// Source location for inter-procedural taint flows
+	SourceLocation LocationInfo
 
 	// Rule metadata (from RuleIR)
 	Rule RuleMetadata
@@ -20,6 +26,9 @@ type EnrichedDetection struct {
 
 	// Detection classification
 	DetectionType DetectionType
+
+	// Config for confidence level thresholds (nil → defaults).
+	Config *QueryTypeConfig
 }
 
 // LocationInfo contains resolved file path and position.
@@ -80,9 +89,9 @@ const (
 // ConfidenceLevel returns human-readable confidence.
 func (e *EnrichedDetection) ConfidenceLevel() string {
 	switch {
-	case e.Detection.Confidence >= 0.8:
+	case e.Detection.Confidence >= e.Config.getHighThreshold():
 		return "high"
-	case e.Detection.Confidence >= 0.5:
+	case e.Detection.Confidence >= e.Config.getMediumThreshold():
 		return "medium"
 	default:
 		return "low"

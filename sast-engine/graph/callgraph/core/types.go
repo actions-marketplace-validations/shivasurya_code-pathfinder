@@ -1,6 +1,8 @@
 package core
 
 import (
+	"slices"
+
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph"
 )
 
@@ -28,6 +30,10 @@ type CallSite struct {
 	InferredType             string  // The inferred type FQN (e.g., "builtins.str", "test.User")
 	TypeConfidence           float32 // Confidence score of the type inference (0.0-1.0)
 	TypeSource               string  // How type was inferred (e.g., "literal", "return_type", "class_instantiation")
+
+	// IsStdlib is true when the resolved target is a Go standard library function.
+	// Set during Go call graph construction when StdlibLoader is available.
+	IsStdlib bool
 }
 
 // Resolution failure reason categories for diagnostics:
@@ -45,6 +51,23 @@ type Argument struct {
 	Value      string // The argument expression as a string
 	IsVariable bool   // Whether this argument is a variable reference
 	Position   int    // Position in the argument list (0-indexed)
+}
+
+// ParameterSymbol represents a typed function/method parameter as a standalone symbol.
+// This enables querying parameter types via find_symbol(type="parameter").
+//
+// Example:
+//
+//	def add(a: int, b: int) -> int:
+//	  Produces two ParameterSymbol entries:
+//	  - {Name: "a", TypeAnnotation: "int", ParentFQN: "module.add"}
+//	  - {Name: "b", TypeAnnotation: "int", ParentFQN: "module.add"}
+type ParameterSymbol struct {
+	Name           string // Parameter name (e.g., "a")
+	TypeAnnotation string // Type annotation (e.g., "int", "QuerySet[ModelType]")
+	ParentFQN      string // FQN of the containing function/method
+	File           string // Source file path
+	Line           uint32 // Line number of the function definition
 }
 
 // CallGraph represents the complete call graph of a program.
@@ -77,15 +100,61 @@ type CallGraph struct {
 	// This allows quick lookup of function metadata (line number, file, etc.)
 	Functions map[string]*graph.Node
 
+	// Typed function/method parameters as standalone symbols.
+	// Key: parameter FQN (e.g., "myapp.auth.validate_user.username")
+	// Value: parameter type information
+	// Populated during call graph construction from MethodArgumentsType.
+	Parameters map[string]*ParameterSymbol
+
 	// Taint summaries for each function (intra-procedural analysis results)
 	// Key: function FQN
 	// Value: TaintSummary with taint flow information
 	Summaries map[string]*TaintSummary
 
+	// Statements stores extracted statements per function FQN for demand-driven dataflow analysis.
+	// Populated during call graph Pass 5 (taint summary generation).
+	Statements map[string][]*Statement
+
+	// CFGs stores control flow graphs per function FQN for CFG-aware dataflow analysis.
+	// Populated during call graph Pass 5 (taint summary generation).
+	// Key: function FQN, Value: opaque interface to avoid import cycle with cfg package.
+	CFGs map[string]any
+
+	// CFGBlockStatements stores statements organized by basic block for CFG-aware analysis.
+	// Key: function FQN, Value: opaque interface (cfg.BlockStatements) to avoid import cycle.
+	CFGBlockStatements map[string]any
+
 	// Attribute registry for class attributes and instance variables
 	// Populated during call graph construction (Phase 3: Extract Class Attributes)
 	// Enables symbol search to find class fields and properties
-	Attributes interface{} // *registry.AttributeRegistry (interface{} to avoid import cycle)
+	Attributes any // *registry.AttributeRegistry (interface{} to avoid import cycle)
+
+	// Type inference engine for querying module-level variable types (Python)
+	// Populated during call graph construction
+	// *resolution.TypeInferenceEngine (interface to avoid import cycle)
+	TypeEngine ModuleVariableProvider
+
+	// Go type inference engine for Phase 2 type tracking
+	// Stores return types and variable bindings extracted during call graph construction
+	// *resolution.GoTypeInferenceEngine (interface to avoid import cycle)
+	GoTypeEngine GoTypeProvider
+
+	// Third-party type registry for inheritance-aware matching (MRO lookups).
+	// Populated during call graph construction.
+	// *registry.ThirdPartyRegistryRemote (stored as any to avoid import cycle)
+	// Implements dsl.InheritanceChecker interface.
+	ThirdPartyRemote any
+
+	// Stdlib type registry for inheritance-aware matching (MRO lookups).
+	// Populated during call graph construction.
+	// *registry.StdlibRegistryRemote (stored as any to avoid import cycle)
+	// Implements dsl.InheritanceChecker interface.
+	StdlibRemote any
+
+	// GoStructFieldIndex maps "pkgPath.TypeName.FieldName" → resolved field type FQN.
+	// Populated during call graph construction (Pass 4 setup) from struct_definition nodes.
+	// Used by resolveGoCallTarget Source 4 to resolve chained field access like a.Field.Method().
+	GoStructFieldIndex map[string]string
 }
 
 // NewCallGraph creates and initializes a new CallGraph instance.
@@ -96,7 +165,12 @@ func NewCallGraph() *CallGraph {
 		ReverseEdges: make(map[string][]string),
 		CallSites:    make(map[string][]CallSite),
 		Functions:    make(map[string]*graph.Node),
+		Parameters:   make(map[string]*ParameterSymbol),
 		Summaries:    make(map[string]*TaintSummary),
+		Statements:         make(map[string][]*Statement),
+		CFGs:               make(map[string]any),
+		CFGBlockStatements: make(map[string]any),
+		GoStructFieldIndex: make(map[string]string),
 	}
 }
 
@@ -156,6 +230,12 @@ func (cg *CallGraph) GetCallees(caller string) []string {
 		return callees
 	}
 	return []string{}
+}
+
+// GetGoTypeEngine returns the Go type inference engine.
+// Returns nil if no type engine has been attached to this call graph.
+func (cg *CallGraph) GetGoTypeEngine() GoTypeProvider {
+	return cg.GoTypeEngine
 }
 
 // ModuleRegistry maintains the mapping between Python file paths and module paths.
@@ -269,19 +349,216 @@ func (im *ImportMap) Resolve(alias string) (string, bool) {
 	return fqn, ok
 }
 
+// GoModuleRegistry maps directory paths to Go import paths.
+// Enables resolution of package-qualified function calls.
+//
+// Unlike Python's ModuleRegistry (which maps files to modules), Go's registry maps
+// directories to packages because multiple .go files can share the same package.
+// The module path comes from go.mod, not directory names.
+//
+// Example:
+//
+//	go.mod: module github.com/example/myapp
+//	Directory: /project/handlers/
+//	Import path: github.com/example/myapp/handlers
+type GoModuleRegistry struct {
+	// Module path from go.mod (e.g., "github.com/example/myapp").
+	ModulePath string
+
+	// Go version from go.mod (e.g., "1.21").
+	GoVersion string
+
+	// Maps absolute directory path to full import path.
+	// Key: "/abs/path/to/project/handlers"
+	// Value: "github.com/example/myapp/handlers"
+	DirToImport map[string]string
+
+	// Reverse mapping for quick lookups.
+	// Key: "github.com/example/myapp/handlers"
+	// Value: "/abs/path/to/project/handlers"
+	ImportToDir map[string]string
+
+	// Standard library package names for quick detection.
+	// Key: package name (e.g., "fmt", "net/http")
+	// Value: always true (set semantics)
+	StdlibPackages map[string]bool
+
+	// StdlibLoader provides function-level metadata for Go stdlib packages.
+	// It is initialized lazily from the CDN registry during call graph construction.
+	// Nil when stdlib registry loading is disabled or unavailable.
+	StdlibLoader GoStdlibLoader
+
+	// ThirdPartyLoader provides type metadata for Go third-party libraries.
+	// Parses from vendor/ or GOMODCACHE. Nil when unavailable.
+	ThirdPartyLoader GoThirdPartyLoader
+}
+
+// NewGoModuleRegistry creates an initialized GoModuleRegistry.
+func NewGoModuleRegistry() *GoModuleRegistry {
+	return &GoModuleRegistry{
+		DirToImport:    make(map[string]string),
+		ImportToDir:    make(map[string]string),
+		StdlibPackages: make(map[string]bool),
+	}
+}
+
+// GoImportMap represents imports in a single Go file.
+// Maps local names (identifiers or aliases) to full import paths.
+//
+// Example:
+//
+//	import (
+//	    "fmt"                                    // "fmt" -> "fmt"
+//	    h "github.com/myapp/handlers"            // "h" -> "github.com/myapp/handlers"
+//	    . "github.com/myapp/utils"               // "." -> "github.com/myapp/utils"
+//	    _ "github.com/lib/pq"                    // "_" -> "github.com/lib/pq"
+//	)
+type GoImportMap struct {
+	// Maps local name to full import path.
+	// Key: local identifier (e.g., "h", "fmt", ".", "_")
+	// Value: full import path
+	Imports map[string]string
+
+	// Absolute path to the file containing these imports.
+	FilePath string
+
+	// Package name from "package X" declaration.
+	// Used to determine if a type reference is local to the package.
+	PackageName string
+}
+
+// NewGoImportMap creates an initialized GoImportMap.
+func NewGoImportMap(filePath string) *GoImportMap {
+	return &GoImportMap{
+		Imports:  make(map[string]string),
+		FilePath: filePath,
+	}
+}
+
+// AddImport adds an import mapping.
+//
+// Parameters:
+//   - localName: the local identifier used in the file (e.g., "h", "fmt", ".")
+//   - importPath: the full import path (e.g., "github.com/myapp/handlers")
+func (gim *GoImportMap) AddImport(localName, importPath string) {
+	gim.Imports[localName] = importPath
+}
+
+// Resolve looks up the import path for a local name.
+//
+// Parameters:
+//   - localName: the local identifier to resolve
+//
+// Returns:
+//   - import path and true if found, empty string and false otherwise
+func (gim *GoImportMap) Resolve(localName string) (string, bool) {
+	path, ok := gim.Imports[localName]
+	return path, ok
+}
+
 // Helper function to check if a string slice contains a specific string.
 func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, item)
 }
 
 // Helper function alias for consistency.
 func containsString(slice []string, item string) bool {
 	return contains(slice, item)
+}
+
+// ModuleVariableInfo holds type information for a module-level variable.
+type ModuleVariableInfo struct {
+	TypeFQN    string  // Fully qualified type name (e.g., "builtins.int", "helpers.Calculator")
+	Confidence float64 // Confidence score (0.0-1.0)
+	Source     string  // How the type was inferred (e.g., "literal", "class_instantiation")
+}
+
+// ModuleVariableProvider provides type information for module-level variables.
+// Implemented by resolution.TypeInferenceEngine.
+type ModuleVariableProvider interface {
+	GetModuleVariableType(modulePath string, varName string, line uint32) *ModuleVariableInfo
+}
+
+// GoTypeProvider provides access to Go type information.
+// This interface avoids import cycles between core and resolution packages.
+// Implemented by *resolution.GoTypeInferenceEngine.
+type GoTypeProvider interface {
+	GetReturnType(functionFQN string) (*TypeInfo, bool)
+	GetAllReturnTypes() map[string]*TypeInfo
+}
+
+// GoCallEdge represents a single call graph edge for Go code with stdlib classification metadata.
+// It extends the basic caller → callee relationship with source location, argument capture,
+// and confidence scoring to support accurate data-flow analysis.
+type GoCallEdge struct {
+	// Source is the fully qualified name of the calling function.
+	Source string
+	// Target is the fully qualified name or import-path of the called function.
+	Target string
+	// CallType describes the kind of call: "call", "method_call", or "stdlib_call".
+	CallType string
+	// LineNumber is the source line where the call expression appears.
+	LineNumber uint32
+	// Arguments holds the argument expressions captured at the call site.
+	Arguments []string
+	// FilePath is the absolute path to the source file containing the call.
+	FilePath string
+	// IsExternal is true when the target is outside the project (stdlib or third-party).
+	IsExternal bool
+	// IsStdlib is true when the target is a Go standard library function.
+	IsStdlib bool
+	// Confidence is the call-target resolution confidence score in [0.0, 1.0].
+	Confidence float32
+}
+
+// NewGoCallEdge creates a new GoCallEdge with the given source and target.
+// The CallType field defaults to "call".
+func NewGoCallEdge(source, target string) *GoCallEdge {
+	return &GoCallEdge{
+		Source:   source,
+		Target:   target,
+		CallType: "call",
+	}
+}
+
+// GoStdlibLoader provides access to Go standard library function and type metadata.
+// The interface decouples the core package from the registry package, avoiding import cycles.
+// It is implemented by registry.GoStdlibRegistryRemote.
+type GoStdlibLoader interface {
+	// ValidateStdlibImport reports whether the given import path belongs to the Go stdlib.
+	ValidateStdlibImport(importPath string) bool
+
+	// GetFunction returns the metadata for a named function in the given stdlib package.
+	// Returns a non-nil error if the package or function is not found in the registry.
+	GetFunction(importPath, funcName string) (*GoStdlibFunction, error)
+
+	// GetType returns the metadata for a named type in the given stdlib package.
+	// Returns a non-nil error if the package or type is not found in the registry.
+	GetType(importPath, typeName string) (*GoStdlibType, error)
+
+	// GetPackage returns all type and function metadata for a stdlib package.
+	// Used to scan for interface types that expose promoted methods.
+	GetPackage(importPath string) (*GoStdlibPackage, error)
+
+	// PackageCount returns the total number of stdlib packages available in the registry.
+	PackageCount() int
+}
+
+// GoThirdPartyLoader provides access to Go third-party library type metadata.
+// Mirrors GoStdlibLoader and reuses the same GoStdlibType/GoStdlibFunction structs.
+// Implemented by registry.GoThirdPartyLocalLoader.
+type GoThirdPartyLoader interface {
+	// ValidateImport reports whether the given import path is a known third-party package.
+	ValidateImport(importPath string) bool
+
+	// GetFunction returns the metadata for a named function in the given third-party package.
+	GetFunction(importPath, funcName string) (*GoStdlibFunction, error)
+
+	// GetType returns the metadata for a named type in the given third-party package.
+	GetType(importPath, typeName string) (*GoStdlibType, error)
+
+	// PackageCount returns the total number of third-party packages available.
+	PackageCount() int
 }
 
 // Helper function to extract the last component of a dotted path.

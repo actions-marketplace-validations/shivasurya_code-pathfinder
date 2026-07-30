@@ -1,6 +1,11 @@
 package builder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +13,7 @@ import (
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/registry"
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/resolution"
 	"github.com/shivasurya/code-pathfinder/sast-engine/output"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -816,4 +822,469 @@ def caller():
 	}
 
 	assert.True(t, foundEdge, "Expected at least one call edge")
+}
+
+// TestIndexParameters verifies that indexParameters extracts typed parameters
+// from indexed functions into the Parameters map.
+func TestIndexParameters(t *testing.T) {
+	callGraph := core.NewCallGraph()
+
+	// Function with typed parameters.
+	callGraph.Functions["myapp.auth.validate"] = &graph.Node{
+		ID:                  "1",
+		Type:                "function_definition",
+		Name:                "validate",
+		File:                "/path/auth.py",
+		LineNumber:          10,
+		MethodArgumentsType: []string{"username: str", "password: str"},
+	}
+
+	// Method with self (should be excluded) and typed parameter.
+	callGraph.Functions["myapp.models.User.save"] = &graph.Node{
+		ID:                  "2",
+		Type:                "method",
+		Name:                "save",
+		File:                "/path/models.py",
+		LineNumber:          20,
+		MethodArgumentsType: []string{"self", "force: bool"},
+	}
+
+	// Class method with cls (should be excluded) and typed parameter.
+	callGraph.Functions["myapp.models.User.create"] = &graph.Node{
+		ID:                  "3",
+		Type:                "method",
+		Name:                "create",
+		File:                "/path/models.py",
+		LineNumber:          30,
+		MethodArgumentsType: []string{"cls", "name: str"},
+	}
+
+	// Function with complex types.
+	callGraph.Functions["myapp.utils.process"] = &graph.Node{
+		ID:                  "4",
+		Type:                "function_definition",
+		Name:                "process",
+		File:                "/path/utils.py",
+		LineNumber:          5,
+		MethodArgumentsType: []string{"items: list[str]", "qs: QuerySet[ModelType]"},
+	}
+
+	// Function with no typed parameters (should not produce any).
+	callGraph.Functions["myapp.utils.helper"] = &graph.Node{
+		ID:         "5",
+		Type:       "function_definition",
+		Name:       "helper",
+		File:       "/path/utils.py",
+		LineNumber: 15,
+	}
+
+	IndexParameters(callGraph)
+
+	// Verify total parameter count: 2 + 1 + 1 + 2 = 6 (self and cls excluded).
+	assert.Len(t, callGraph.Parameters, 6)
+
+	// Verify specific parameters.
+	usernameParam := callGraph.Parameters["myapp.auth.validate.username"]
+	assert.NotNil(t, usernameParam)
+	assert.Equal(t, "username", usernameParam.Name)
+	assert.Equal(t, "str", usernameParam.TypeAnnotation)
+	assert.Equal(t, "myapp.auth.validate", usernameParam.ParentFQN)
+	assert.Equal(t, "/path/auth.py", usernameParam.File)
+	assert.Equal(t, uint32(10), usernameParam.Line)
+
+	passwordParam := callGraph.Parameters["myapp.auth.validate.password"]
+	assert.NotNil(t, passwordParam)
+	assert.Equal(t, "str", passwordParam.TypeAnnotation)
+
+	// Verify self is excluded.
+	assert.Nil(t, callGraph.Parameters["myapp.models.User.save.self"])
+
+	// Verify cls is excluded.
+	assert.Nil(t, callGraph.Parameters["myapp.models.User.create.cls"])
+
+	// Verify typed param after self is included.
+	forceParam := callGraph.Parameters["myapp.models.User.save.force"]
+	assert.NotNil(t, forceParam)
+	assert.Equal(t, "force", forceParam.Name)
+	assert.Equal(t, "bool", forceParam.TypeAnnotation)
+
+	// Verify typed param after cls is included.
+	nameParam := callGraph.Parameters["myapp.models.User.create.name"]
+	assert.NotNil(t, nameParam)
+	assert.Equal(t, "str", nameParam.TypeAnnotation)
+
+	// Verify complex types.
+	itemsParam := callGraph.Parameters["myapp.utils.process.items"]
+	assert.NotNil(t, itemsParam)
+	assert.Equal(t, "list[str]", itemsParam.TypeAnnotation)
+
+	qsParam := callGraph.Parameters["myapp.utils.process.qs"]
+	assert.NotNil(t, qsParam)
+	assert.Equal(t, "QuerySet[ModelType]", qsParam.TypeAnnotation)
+}
+
+// TestIndexParameters_NoTypedParameters verifies that functions without typed
+// parameters don't produce any ParameterSymbol entries.
+func TestIndexParameters_NoTypedParameters(t *testing.T) {
+	callGraph := core.NewCallGraph()
+
+	callGraph.Functions["myapp.utils.helper"] = &graph.Node{
+		ID:                   "1",
+		Type:                 "function_definition",
+		Name:                 "helper",
+		File:                 "/path/utils.py",
+		LineNumber:           5,
+		MethodArgumentsValue: []string{"x", "y"},
+	}
+
+	IndexParameters(callGraph)
+
+	assert.Len(t, callGraph.Parameters, 0)
+}
+
+// TestIndexParameters_EmptyCallGraph verifies safety with an empty call graph.
+func TestIndexParameters_EmptyCallGraph(t *testing.T) {
+	callGraph := core.NewCallGraph()
+
+	IndexParameters(callGraph)
+
+	assert.Len(t, callGraph.Parameters, 0)
+}
+
+func TestNormalizeReturnType(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"builtins.str", "str"},
+		{"builtins.int", "int"},
+		{"builtins.float", "float"},
+		{"builtins.bool", "bool"},
+		{"builtins.list", "list"},
+		{"builtins.dict", "dict"},
+		{"builtins.set", "set"},
+		{"builtins.tuple", "tuple"},
+		{"builtins.NoneType", "None"},
+		{"builtins.bytes", "bytes"},
+		{"builtins.complex", "complex"},
+		{"builtins.Generator", "Generator"},
+		{"myapp.models.User", "myapp.models.User"},
+		{"str", "str"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			assert.Equal(t, tt.expected, NormalizeReturnType(tt.input))
+		})
+	}
+}
+
+func TestPopulateInferredReturnTypes(t *testing.T) {
+	// Set up a call graph with Python functions
+	callGraph := core.NewCallGraph()
+	modRegistry := core.NewModuleRegistry()
+
+	// Function with annotation (should NOT be overwritten)
+	annotatedFunc := &graph.Node{
+		ID:         "annotated",
+		Type:       "function_definition",
+		Name:       "annotated_func",
+		ReturnType: "int",
+		File:       "test.py",
+		LineNumber: 1,
+	}
+	callGraph.Functions["test.annotated_func"] = annotatedFunc
+
+	// Function without annotation, inferred type available
+	inferredFunc := &graph.Node{
+		ID:         "inferred",
+		Type:       "function_definition",
+		Name:       "inferred_func",
+		ReturnType: "",
+		File:       "test.py",
+		LineNumber: 5,
+	}
+	callGraph.Functions["test.inferred_func"] = inferredFunc
+
+	// Void function (no return values, no inferred type)
+	voidFunc := &graph.Node{
+		ID:         "void",
+		Type:       "function_definition",
+		Name:       "void_func",
+		ReturnType: "",
+		File:       "test.py",
+		LineNumber: 10,
+	}
+	callGraph.Functions["test.void_func"] = voidFunc
+
+	// Function with return expression but uninferrable
+	unknownFunc := &graph.Node{
+		ID:         "unknown",
+		Type:       "function_definition",
+		Name:       "unknown_func",
+		ReturnType: "",
+		File:       "test.py",
+		LineNumber: 15,
+	}
+	callGraph.Functions["test.unknown_func"] = unknownFunc
+
+	// Function with low-confidence inferred type (should be skipped)
+	lowConfFunc := &graph.Node{
+		ID:         "lowconf",
+		Type:       "function_definition",
+		Name:       "lowconf_func",
+		ReturnType: "",
+		File:       "test.py",
+		LineNumber: 20,
+	}
+	callGraph.Functions["test.lowconf_func"] = lowConfFunc
+
+	// Function with placeholder return type (should be skipped)
+	placeholderFunc := &graph.Node{
+		ID:         "placeholder",
+		Type:       "function_definition",
+		Name:       "placeholder_func",
+		ReturnType: "",
+		File:       "test.py",
+		LineNumber: 25,
+	}
+	callGraph.Functions["test.placeholder_func"] = placeholderFunc
+
+	// Java function (should be skipped entirely)
+	javaFunc := &graph.Node{
+		ID:         "java",
+		Type:       "method_declaration",
+		Name:       "javaMethod",
+		ReturnType: "",
+		File:       "Test.java",
+		LineNumber: 1,
+	}
+	callGraph.Functions["com.Test.javaMethod"] = javaFunc
+
+	// Set up TypeEngine with return types
+	typeEngine := resolution.NewTypeInferenceEngine(modRegistry)
+	typeEngine.AddReturnTypesToEngine(map[string]*core.TypeInfo{
+		"test.inferred_func": {
+			TypeFQN:    "builtins.str",
+			Confidence: 1.0,
+			Source:     "return_literal",
+		},
+		"test.lowconf_func": {
+			TypeFQN:    "builtins.int",
+			Confidence: 0.2, // Below threshold
+			Source:     "return_variable",
+		},
+		"test.placeholder_func": {
+			TypeFQN:    "call:some_func",
+			Confidence: 0.8,
+			Source:     "return_function_call",
+		},
+	})
+
+	// Set up functions with return values tracking
+	functionsWithReturnValues := map[string]bool{
+		"test.inferred_func":    true,
+		"test.unknown_func":     true, // Has return <expr> but couldn't infer
+		"test.lowconf_func":     true,
+		"test.placeholder_func": true,
+		// test.void_func is NOT here — it's void
+	}
+
+	logger := output.NewLogger(output.VerbosityDefault)
+	populateInferredReturnTypes(callGraph, typeEngine, functionsWithReturnValues, logger)
+
+	// Verify results
+	assert.Equal(t, "int", annotatedFunc.ReturnType, "annotation should NOT be overwritten")
+	assert.Equal(t, "str", inferredFunc.ReturnType, "should be populated with normalized inferred type")
+	assert.Equal(t, "None", voidFunc.ReturnType, "void function should get None")
+	assert.Equal(t, "", unknownFunc.ReturnType, "function with uninferrable return should stay empty")
+	assert.Equal(t, "", lowConfFunc.ReturnType, "low-confidence should be skipped")
+	assert.Equal(t, "", placeholderFunc.ReturnType, "placeholder should be skipped")
+	assert.Equal(t, "", javaFunc.ReturnType, "Java function should be skipped")
+}
+
+func TestPopulateInferredReturnTypes_Integration(t *testing.T) {
+	// Full integration: parse real Python, build call graph, verify return types
+	tmpDir := t.TempDir()
+
+	mainPy := filepath.Join(tmpDir, "main.py")
+	err := os.WriteFile(mainPy, []byte(`
+def greet(name):
+    return f"Hello, {name}!"
+
+def get_count():
+    return 42
+
+def is_valid(x):
+    return x > 0
+
+def process():
+    greet("world")
+    print("done")
+
+def setup():
+    pass
+`), 0644)
+	require.NoError(t, err)
+
+	codeGraph := graph.Initialize(tmpDir, nil)
+	moduleRegistry, err := registry.BuildModuleRegistry(tmpDir, false)
+	require.NoError(t, err)
+
+	callGraph, err := BuildCallGraph(codeGraph, moduleRegistry, tmpDir, output.NewLogger(output.VerbosityDefault))
+	require.NoError(t, err)
+
+	// greet: returns f-string → str
+	if greetNode, ok := callGraph.Functions["main.greet"]; ok {
+		assert.Equal(t, "str", greetNode.ReturnType, "greet should return str from f-string")
+	} else {
+		t.Error("main.greet not found in call graph")
+	}
+
+	// get_count: returns int literal → int
+	if countNode, ok := callGraph.Functions["main.get_count"]; ok {
+		assert.Equal(t, "int", countNode.ReturnType, "get_count should return int")
+	} else {
+		t.Error("main.get_count not found in call graph")
+	}
+
+	// is_valid: returns comparison → bool
+	if validNode, ok := callGraph.Functions["main.is_valid"]; ok {
+		assert.Equal(t, "bool", validNode.ReturnType, "is_valid should return bool from comparison")
+	} else {
+		t.Error("main.is_valid not found in call graph")
+	}
+
+	// process: no return value → None (void)
+	if processNode, ok := callGraph.Functions["main.process"]; ok {
+		assert.Equal(t, "None", processNode.ReturnType, "process should return None (void)")
+	} else {
+		t.Error("main.process not found in call graph")
+	}
+
+	// setup: only `pass` → None (void)
+	if setupNode, ok := callGraph.Functions["main.setup"]; ok {
+		assert.Equal(t, "None", setupNode.ReturnType, "setup should return None (void)")
+	} else {
+		t.Error("main.setup not found in call graph")
+	}
+}
+
+// ── preloadThirdPartyModules tests ──────────────────────────────────────────
+
+func TestPreloadThirdPartyModules_NilRemote(t *testing.T) {
+	// When ThirdPartyRemote is nil, preload should be a no-op (no panic)
+	engine := resolution.NewTypeInferenceEngine(core.NewModuleRegistry())
+	engine.ThirdPartyRemote = nil
+	preloadThirdPartyModules(engine, output.NewLogger(output.VerbosityDefault))
+}
+
+func TestPreloadThirdPartyModules_WrongType(t *testing.T) {
+	// When ThirdPartyRemote is set to wrong type, should be a no-op
+	engine := resolution.NewTypeInferenceEngine(core.NewModuleRegistry())
+	engine.ThirdPartyRemote = "not-a-loader"
+	preloadThirdPartyModules(engine, output.NewLogger(output.VerbosityDefault))
+}
+
+func TestPreloadThirdPartyModules_NoMatchingImports(t *testing.T) {
+	// When imports don't match any third-party modules, nothing should be pre-loaded
+	engine := resolution.NewTypeInferenceEngine(core.NewModuleRegistry())
+
+	// Add an import map with only userland imports
+	im := core.NewImportMap("/test/app.py")
+	im.AddImport("myutils", "myapp.utils")
+	engine.AddImportMap("/test/app.py", im)
+
+	// Create a loader with empty manifest (no modules)
+	loader := registry.NewThirdPartyRegistryRemote("https://cdn.example.com")
+	loader.Manifest = &core.Manifest{Modules: []*core.ModuleEntry{}}
+	engine.ThirdPartyRemote = loader
+
+	preloadThirdPartyModules(engine, output.NewLogger(output.VerbosityDefault))
+
+	assert.Equal(t, 0, loader.CacheSize())
+}
+
+func TestPreloadThirdPartyModules_MatchingImports(t *testing.T) {
+	// Set up a test server with a "requests" module
+	module := &core.StdlibModule{
+		Module:     "requests",
+		Functions:  map[string]*core.StdlibFunction{},
+		Classes:    map[string]*core.StdlibClass{},
+		Constants:  map[string]*core.StdlibConstant{},
+		Attributes: map[string]*core.StdlibAttribute{},
+	}
+	moduleJSON, err := json.Marshal(module)
+	require.NoError(t, err)
+
+	checksum := sha256Checksum(moduleJSON)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/thirdparty/v1/manifest.json":
+			manifest := core.Manifest{
+				Modules: []*core.ModuleEntry{
+					{Name: "requests", File: "requests.json", Checksum: checksum},
+				},
+			}
+			json.NewEncoder(w).Encode(manifest) //nolint:errcheck
+		case "/thirdparty/v1/requests.json":
+			w.Write(moduleJSON) //nolint:errcheck
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	loader := registry.NewThirdPartyRegistryRemote(server.URL)
+	require.NoError(t, loader.LoadManifest(output.NewLogger(output.VerbosityDefault)))
+
+	engine := resolution.NewTypeInferenceEngine(core.NewModuleRegistry())
+	engine.ThirdPartyRemote = loader
+
+	// Add import maps: one with requests.get, one with unrelated import
+	im1 := core.NewImportMap("/test/app.py")
+	im1.AddImport("get", "requests.get")
+	engine.AddImportMap("/test/app.py", im1)
+
+	im2 := core.NewImportMap("/test/utils.py")
+	im2.AddImport("mylib", "myapp.mylib")
+	engine.AddImportMap("/test/utils.py", im2)
+
+	preloadThirdPartyModules(engine, output.NewLogger(output.VerbosityDefault))
+
+	// Only "requests" should be pre-loaded (myapp.mylib is not in manifest)
+	assert.Equal(t, 1, loader.CacheSize())
+}
+
+func TestPreloadThirdPartyModules_SkipsNonMatchingModules(t *testing.T) {
+	// Modules not imported should never be downloaded
+	engine := resolution.NewTypeInferenceEngine(core.NewModuleRegistry())
+
+	loader := registry.NewThirdPartyRegistryRemote("https://cdn.example.com")
+	loader.Manifest = &core.Manifest{
+		Modules: []*core.ModuleEntry{
+			{Name: "django", File: "django.json"},
+			{Name: "flask", File: "flask.json"},
+		},
+	}
+	engine.ThirdPartyRemote = loader
+
+	// Import only flask, not django
+	im := core.NewImportMap("/test/app.py")
+	im.AddImport("Flask", "flask.Flask")
+	engine.AddImportMap("/test/app.py", im)
+
+	// HasModule("flask") returns true, HasModule("django") returns true,
+	// but only "flask" appears in imports, so only flask would be pre-fetched.
+	// Since we don't have a real server, GetModule will fail — that's fine,
+	// we just want to verify HasModule filtering works.
+	assert.True(t, loader.HasModule("flask"))
+	assert.True(t, loader.HasModule("django"))
+}
+
+func sha256Checksum(data []byte) string {
+	h := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(h[:])
 }

@@ -1,10 +1,11 @@
 """
-Core matchers for the pathfinder Python DSL.
+Core matchers for the pathfinder Python SDK.
 
 These matchers generate JSON IR for the Go executor.
 """
 
-from typing import Dict, Optional, Union, List, Any
+from typing import Any, Dict, List, Optional, Union
+
 from .ir import IRType
 
 ArgumentValue = Union[str, int, float, bool, List[Union[str, int, float, bool]]]
@@ -56,6 +57,7 @@ class CallMatcher:
         self.wildcard = any("*" in p for p in patterns)
         self.match_position = match_position or {}
         self.match_name = match_name or {}
+        self._tracked_params: List[Dict[str, Any]] = []
 
     def _make_constraint(self, value: ArgumentValue) -> Dict[str, Any]:
         """
@@ -82,6 +84,24 @@ class CallMatcher:
             )
 
         return {"value": value, "wildcard": has_wildcard}
+
+    def tracks(self, *positions_or_names: object) -> "CallMatcher":
+        """Specify which parameters are taint-sensitive in dataflow analysis.
+
+        Same API as MethodMatcher.tracks(). See MethodMatcher for full docs.
+        """
+        for p in positions_or_names:
+            if isinstance(p, int):
+                self._tracked_params.append({"index": p})
+            elif p == "return":
+                self._tracked_params.append({"return": True})
+            elif isinstance(p, str):
+                self._tracked_params.append({"name": p})
+            else:
+                raise TypeError(
+                    f"tracks() accepts int, str, or 'return', got {type(p)}"
+                )
+        return self
 
     def to_ir(self) -> dict:
         """
@@ -125,6 +145,9 @@ class CallMatcher:
                     constraint["wildcard"] = True
                 keyword_args[name] = constraint
             ir["keywordArgs"] = keyword_args
+
+        if self._tracked_params:
+            ir["trackedParams"] = self._tracked_params
 
         return ir
 
@@ -176,6 +199,39 @@ class VariableMatcher:
 
     def __repr__(self) -> str:
         return f'variable("{self.pattern}")'
+
+
+class AttributeMatcher:
+    """
+    Matches attribute access on the RHS of assignments, including dict/list
+    subscript access on attribute chains.
+
+    Examples:
+        attribute("request.url")           # x = request.url
+        attribute("file.filename")         # name = file.filename
+        attribute("request.url", "request.host")  # Multiple patterns
+        attribute("request.GET")           # x = request.GET["key"]
+        attribute("request.POST")          # x = request.POST["key"]
+        attribute("os.environ")            # x = os.environ["VAR"]
+        attribute("flask.request.form")    # x = flask.request.form["field"]
+    """
+
+    def __init__(self, *patterns: str):
+        if not patterns:
+            raise ValueError("attribute() requires at least one pattern")
+        if any(not p or not isinstance(p, str) for p in patterns):
+            raise ValueError("All patterns must be non-empty strings")
+        self.patterns = list(patterns)
+
+    def to_ir(self) -> dict:
+        return {
+            "type": IRType.ATTRIBUTE_MATCHER.value,
+            "patterns": self.patterns,
+        }
+
+    def __repr__(self) -> str:
+        patterns_str = ", ".join(f'"{p}"' for p in self.patterns)
+        return f"attribute({patterns_str})"
 
 
 # Public API
@@ -241,3 +297,26 @@ def variable(pattern: str) -> VariableMatcher:
         variable("*_id")
     """
     return VariableMatcher(pattern)
+
+
+def attribute(*patterns: str) -> AttributeMatcher:
+    """
+    Create a matcher for attribute access (not function calls).
+
+    Use this when the taint source is a property/attribute, not a method call.
+    Common in web frameworks: request.url, request.data, file.filename.
+
+    Args:
+        *patterns: Attribute access patterns to match.
+
+    Returns:
+        AttributeMatcher instance
+
+    Examples:
+        >>> attribute("request.url")
+        attribute("request.url")
+
+        >>> attribute("request.url", "request.host", "request.data")
+        attribute("request.url", "request.host", "request.data")
+    """
+    return AttributeMatcher(*patterns)

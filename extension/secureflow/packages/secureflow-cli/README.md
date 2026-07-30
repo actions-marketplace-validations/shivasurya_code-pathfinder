@@ -6,11 +6,11 @@
 
 </div>
 
-# SecureFlow CLI
+# Code Pathfinder CLI
 
 AI-powered security analysis for your codebase from the command line.
 
-SecureFlow CLI runs security analysis on your projects using AI models. It analyzes code structure, identifies vulnerabilities, and provides actionable security insights with a TUI interface.
+Code Pathfinder CLI runs security analysis on your projects using AI models. It analyzes code structure, identifies vulnerabilities, and provides actionable security insights with a TUI interface.
 
 ## Features
 
@@ -37,7 +37,7 @@ npm install -g @codepathfinder/secureflow-cli
 
 ### 2. Configure Your AI Model
 
-SecureFlow CLI requires an AI model to perform analysis. Set up your API key:
+Code Pathfinder CLI requires an AI model to perform analysis. Set up your API key:
 
 ```bash
 # Check current configuration
@@ -48,11 +48,11 @@ secureflow config --show
 ```
 
 **Supported Models:**
-- **Anthropic Claude**: `claude-sonnet-4-5-20250929` (recommended), `claude-opus-4-1-20250805`, `claude-sonnet-4-20250514`, `claude-3-7-sonnet-20250219`, `claude-3-5-haiku-20241022`, ~~`claude-3-5-sonnet-20241022`~~ (deprecated)
-- **OpenAI**: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `gpt-4.1-2025-04-14`, `o3-mini-2025-01-31`
-- **Google Gemini**: `gemini-2.5-pro`, `gemini-2.5-flash`
-- **xAI Grok**: `grok-4-fast-reasoning`
-- **OpenRouter**: Access 200+ models from multiple providers (use format: `provider/model` e.g., `anthropic/claude-3-5-sonnet`)
+- **Anthropic Claude**: `claude-sonnet-4-6` (recommended), `claude-opus-4-6`, `claude-haiku-4-5`, ~~`claude-sonnet-4-5-20250929`~~ (deprecated), ~~`claude-opus-4-5`~~ (deprecated)
+- **OpenAI**: `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.2`, `gpt-5.1`, `gpt-5-pro`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano`
+- **Google Gemini**: `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`
+- **xAI Grok**: `grok-4-1-fast-reasoning`, `grok-4-fast-reasoning`
+- **OpenRouter**: `qwen/qwen3-coder-next`, `z-ai/glm-5`, `minimax/minimax-m2.5`, `moonshotai/kimi-k2.5`, `deepseek/deepseek-v3.2`
 - **Ollama**: `qwen3:4b`
 
 ### 3. Run Your First Scan
@@ -62,7 +62,7 @@ secureflow config --show
 secureflow scan
 
 # Scan specific project with Claude
-secureflow scan ./my-project --model claude-sonnet-4-5-20250929
+secureflow scan ./my-project --model claude-sonnet-4-6
 
 # Get project profile first
 secureflow profile ./my-project
@@ -99,7 +99,7 @@ secureflow scan \
 - `--defectdojo-token <token>` - API token for authentication
 - `--defectdojo-product-id <id>` - Product ID to submit findings
 - `--defectdojo-engagement-id <id>` - Engagement ID (optional, will create if not provided)
-- `--defectdojo-test-title <title>` - Test title (default: "SecureFlow Scan")
+- `--defectdojo-test-title <title>` - Test title (default: "Code Pathfinder Scan")
 
 ### `profile` - Project Analysis
 
@@ -125,7 +125,7 @@ secureflow config --show --raw    # Show raw configuration (use with caution)
 
 ## Configuration
 
-SecureFlow CLI stores configuration in a local config file. The location is shown when running `secureflow config --show`.
+Code Pathfinder CLI stores configuration in a local config file. The location is shown when running `secureflow config --show`.
 
 **Example Configuration:**
 ```json
@@ -191,7 +191,7 @@ secureflow scan \
 
 ## How It Works
 
-SecureFlow CLI uses an LLM file request system that works like tool calling:
+Code Pathfinder CLI uses an LLM file request system that works like tool calling:
 
 1. **Project Discovery** - Analyzes project structure and identifies key files
 2. **Iterative Analysis** - AI makes targeted file requests using XML-like syntax:

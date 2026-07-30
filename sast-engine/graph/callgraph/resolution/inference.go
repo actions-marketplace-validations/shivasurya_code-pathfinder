@@ -12,22 +12,23 @@ import (
 // It maintains function scopes, return types, and references to other registries.
 // Thread-safe for concurrent access via mutex protection.
 type TypeInferenceEngine struct {
-	Scopes         map[string]*FunctionScope    // Function FQN -> scope
-	ReturnTypes    map[string]*core.TypeInfo    // Function FQN -> return type
-	Builtins       *registry.BuiltinRegistry    // Builtin types registry
-	Registry       *core.ModuleRegistry         // Module registry reference
-	Attributes     *registry.AttributeRegistry  // Class attributes registry (Phase 3 Task 12)
-	StdlibRegistry *core.StdlibRegistry         // Python stdlib registry (PR #2)
-	StdlibRemote   interface{}                  // Remote loader for lazy module loading (PR #3)
-	ImportMaps     map[string]*core.ImportMap   // File path -> ImportMap (P0 fix: for attribute placeholder resolution)
-	scopeMutex     sync.RWMutex                 // Protects Scopes map for concurrent access
-	typeMutex      sync.RWMutex                 // Protects ReturnTypes map for concurrent access
-	importMutex    sync.RWMutex                 // Protects ImportMaps for concurrent access
+	Scopes         map[string]*FunctionScope   // Function FQN -> scope
+	ReturnTypes    map[string]*core.TypeInfo   // Function FQN -> return type
+	Builtins       *registry.BuiltinRegistry   // Builtin types registry
+	Registry       *core.ModuleRegistry        // Module registry reference
+	Attributes     *registry.AttributeRegistry // Class attributes registry (Phase 3 Task 12)
+	StdlibRegistry *core.StdlibRegistry        // Python stdlib registry (PR #2)
+	StdlibRemote     any                         // Remote loader for lazy module loading (PR #3)
+	ThirdPartyRemote any                         // Remote loader for third-party type registries (PR #4)
+	ImportMaps       map[string]*core.ImportMap  // File path -> ImportMap (P0 fix: for attribute placeholder resolution)
+	scopeMutex     sync.RWMutex                // Protects Scopes map for concurrent access
+	typeMutex      sync.RWMutex                // Protects ReturnTypes map for concurrent access
+	importMutex    sync.RWMutex                // Protects ImportMaps for concurrent access
 }
 
 // StdlibRegistryRemote will be defined in registry package.
 // For now, use an interface or accept nil.
-type StdlibRegistryRemote interface{}
+type StdlibRegistryRemote any
 
 // NewTypeInferenceEngine creates a new type inference engine.
 // The engine is initialized with empty scopes and return types.
@@ -101,6 +102,16 @@ func (te *TypeInferenceEngine) GetImportMap(filePath string) *core.ImportMap {
 	return te.ImportMaps[filePath]
 }
 
+// ForEachImportMap iterates over all stored ImportMaps, calling fn for each.
+// Thread-safe for concurrent reads.
+func (te *TypeInferenceEngine) ForEachImportMap(fn func(filePath string, importMap *core.ImportMap)) {
+	te.importMutex.RLock()
+	defer te.importMutex.RUnlock()
+	for filePath, importMap := range te.ImportMaps {
+		fn(filePath, importMap)
+	}
+}
+
 // GetReturnType retrieves a function's return type.
 // Thread-safe for concurrent reads.
 //
@@ -147,16 +158,59 @@ func (te *TypeInferenceEngine) ResolveVariableType(
 	}
 }
 
+// GetModuleVariableType returns type information for a module-level variable.
+// It looks up the module's scope and retrieves the variable binding's type info.
+// When line > 0, it returns the binding at that specific line (for reassignment tracking).
+// When line == 0, it returns the last binding (backward compatibility).
+// Thread-safe for concurrent reads.
+//
+// Parameters:
+//   - modulePath: fully qualified module path (e.g., "main", "helpers")
+//   - varName: variable name (e.g., "x", "calc")
+//   - line: line number to match (0 for last binding)
+//
+// Returns:
+//   - ModuleVariableInfo if the variable has type info, nil otherwise
+func (te *TypeInferenceEngine) GetModuleVariableType(modulePath string, varName string, line uint32) *core.ModuleVariableInfo {
+	scope := te.GetScope(modulePath)
+	if scope == nil {
+		return nil
+	}
+	var binding *VariableBinding
+	if line > 0 {
+		binding = scope.GetVariableAtLine(varName, line)
+	} else {
+		binding = scope.GetVariable(varName)
+	}
+	if binding == nil || binding.Type == nil {
+		return nil
+	}
+	// Skip unresolved placeholders
+	if strings.HasPrefix(binding.Type.TypeFQN, "call:") ||
+		strings.HasPrefix(binding.Type.TypeFQN, "var:") {
+		return nil
+	}
+	return &core.ModuleVariableInfo{
+		TypeFQN:    binding.Type.TypeFQN,
+		Confidence: float64(binding.Type.Confidence),
+		Source:     binding.Type.Source,
+	}
+}
+
 // UpdateVariableBindingsWithFunctionReturns resolves "call:funcName" placeholders.
 // It iterates through all scopes and replaces placeholder types with actual return types.
 //
 // This enables inter-procedural type propagation:
-//   user = create_user()  # Initially typed as "call:create_user"
-//   # After update, typed as "test.User" based on create_user's return type
+//
+//	user = create_user()  # Initially typed as "call:create_user"
+//	# After update, typed as "test.User" based on create_user's return type
 func (te *TypeInferenceEngine) UpdateVariableBindingsWithFunctionReturns() {
 	for _, scope := range te.Scopes {
-		for varName, binding := range scope.Variables {
-			if binding.Type != nil && strings.HasPrefix(binding.Type.TypeFQN, "call:") {
+		for varName, bindings := range scope.Variables {
+			for i, binding := range bindings {
+				if binding == nil || binding.Type == nil || !strings.HasPrefix(binding.Type.TypeFQN, "call:") {
+					continue
+				}
 				// Extract function name from "call:funcName"
 				funcName := strings.TrimPrefix(binding.Type.TypeFQN, "call:")
 
@@ -172,7 +226,8 @@ func (te *TypeInferenceEngine) UpdateVariableBindingsWithFunctionReturns() {
 					methodName := parts[1]
 
 					// Check if receiver is a variable in current scope (instance method)
-					if receiverBinding, exists := scope.Variables[receiver]; exists {
+					receiverBinding := scope.GetVariable(receiver)
+					if receiverBinding != nil {
 						// This is an instance method call: obj.method()
 						if receiverBinding.Type != nil && !strings.HasPrefix(receiverBinding.Type.TypeFQN, "call:") {
 							// Receiver has a concrete type - build class-qualified FQN
@@ -204,10 +259,51 @@ func (te *TypeInferenceEngine) UpdateVariableBindingsWithFunctionReturns() {
 				// Resolve type
 				resolvedType := te.ResolveVariableType(funcFQN, binding.Type.Confidence)
 				if resolvedType != nil {
-					scope.Variables[varName].Type = resolvedType
-					scope.Variables[varName].AssignedFrom = funcFQN
+					scope.Variables[varName][i].Type = resolvedType
+					scope.Variables[varName][i].AssignedFrom = funcFQN
 				}
 			}
+		}
+	}
+}
+
+// ResolveReturnVariableReferences resolves "var:varName" placeholders in return types
+// by looking up the variable's type in the function's scope.
+// This handles the common pattern:
+//
+//	def foo():
+//	    result = some_expression
+//	    return result  # return type was "var:result", resolved to type of result
+//
+// Must be called AFTER ExtractVariableAssignments and BEFORE UpdateVariableBindingsWithFunctionReturns.
+func (te *TypeInferenceEngine) ResolveReturnVariableReferences() {
+	te.typeMutex.Lock()
+	defer te.typeMutex.Unlock()
+
+	for funcFQN, returnType := range te.ReturnTypes {
+		if returnType == nil || !strings.HasPrefix(returnType.TypeFQN, "var:") {
+			continue
+		}
+		varName := strings.TrimPrefix(returnType.TypeFQN, "var:")
+
+		// Look up variable in the function's scope
+		scope := te.GetScope(funcFQN)
+		if scope == nil {
+			continue
+		}
+		binding := scope.GetVariable(varName) // last binding
+		if binding == nil || binding.Type == nil {
+			continue
+		}
+		// Only resolve if the variable has a concrete type (not another placeholder)
+		if strings.HasPrefix(binding.Type.TypeFQN, "call:") ||
+			strings.HasPrefix(binding.Type.TypeFQN, "var:") {
+			continue
+		}
+		te.ReturnTypes[funcFQN] = &core.TypeInfo{
+			TypeFQN:    binding.Type.TypeFQN,
+			Confidence: returnType.Confidence * binding.Type.Confidence,
+			Source:     "return_variable_resolved",
 		}
 	}
 }

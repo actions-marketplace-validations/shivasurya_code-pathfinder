@@ -1,0 +1,65 @@
+id: COMPOSE-SEC-010
+name: Using Host IPC Mode
+short_description: Service uses host IPC namespace. Container shares inter-process communication with
+  host.
+severity: MEDIUM
+category: security
+language: docker-compose
+ruleset: docker-compose/COMPOSE-SEC-010
+cwe:
+- id: CWE-250
+  name: Execution with Unnecessary Privileges
+  url: https://cwe.mitre.org/data/definitions/250.html
+tags:
+- docker-compose
+- compose
+- ipc
+- host-ipc
+- security
+- isolation
+- namespace
+- shared-memory
+- information-disclosure
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'This rule detects services using `ipc: host`, which disables IPC (Inter-Process
+
+  Communication) namespace isolation. This allows the container to share shared
+
+  memory segments, semaphores, and message queues with the host system, potentially
+
+  enabling information disclosure and process interference.'
+message: Service uses host IPC namespace. Container shares inter-process communication with host.
+secure_example: ''
+recommendations:
+  - "Review your Dockerfile to address the using host ipc mode issue"
+  - "Follow Docker official best practices for image building"
+  - "Use docker build --check to validate Dockerfile syntax and best practices"
+detection_scope: ''
+references:
+- title: 'CWE-250: Execution with Unnecessary Privileges'
+  url: https://cwe.mitre.org/data/definitions/250.html
+- title: Docker IPC Namespace Documentation
+  url: https://docs.docker.com/engine/security/#ipc-mode
+- title: System V IPC man pages
+  url: https://man7.org/linux/man-pages/man7/sysvipc.7.html
+compliance: []
+faq:
+  - question: "Why does this rule flag using host ipc mode?"
+    answer: "Service uses host IPC namespace. Container shares inter-process communication with host."
+  - question: "How do I fix this?"
+    answer: "Review the secure code example in the playground above and apply the recommended pattern to your Dockerfile or docker-compose.yml."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/
+security_implications:
+- title: Semaphore Manipulation
+  description: '```bash ipcs -s  # List semaphores # Can potentially cause deadlocks or race conditions
+    ```'
+- title: Message Queue Interception
+  description: '```bash ipcs -q  # List message queues # Can read/modify IPC messages ```'
+- title: Information Disclosure
+  description: 'Shared memory may contain sensitive data like: - Database connection pools - Session data
+    - Cache contents - Cryptographic keys'

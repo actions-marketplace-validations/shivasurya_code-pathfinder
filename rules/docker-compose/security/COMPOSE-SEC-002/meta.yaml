@@ -1,0 +1,67 @@
+id: COMPOSE-SEC-002
+name: Docker Socket Exposed to Container
+short_description: Service mounts Docker socket. The owner of this socket is root. Giving container access
+  to it is equivalent to giving unrestricted root access to host.
+severity: CRITICAL
+category: security
+language: docker-compose
+ruleset: docker-compose/COMPOSE-SEC-002
+cwe:
+- id: CWE-250
+  name: Execution with Unnecessary Privileges
+  url: https://cwe.mitre.org/data/definitions/250.html
+tags:
+- docker-compose
+- compose
+- docker-socket
+- volume
+- security
+- privilege-escalation
+- container-escape
+- daemon
+- critical
+- host-access
+author:
+  name: Shivasurya
+  url: https://x.com/sshivasurya
+description: 'This rule detects docker-compose services that mount the Docker socket
+
+  (/var/run/docker.sock or /run/docker.sock) as a volume. The Docker socket is
+
+  owned by root and provides complete control over the Docker daemon. Giving a
+
+  container access to it is equivalent to giving unrestricted root access to the
+
+  host system.
+
+
+  This is identical to DOCKER-SEC-006 but for docker-compose configurations.'
+message: Service mounts Docker socket. The owner of this socket is root. Giving container access to it
+  is equivalent to giving unrestricted root access to host.
+secure_example: ''
+recommendations:
+  - "Never mount the Docker socket into application containers"
+  - "Use the Docker API over TLS with client certificates if remote access is needed"
+  - "Consider rootless Docker or Podman to reduce socket exposure risk"
+detection_scope: ''
+references:
+- title: 'CWE-250: Execution with Unnecessary Privileges'
+  url: https://cwe.mitre.org/data/definitions/250.html
+- title: Docker Socket Security Advisory
+  url: https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html
+- title: 'CIS Docker Benchmark: Section 5.31'
+  url: https://www.cisecurity.org/benchmark/docker
+- title: OWASP Docker Security Cheat Sheet
+  url: https://owasp.org/www-project-top-ten/
+- title: Tecnativa Docker Socket Proxy documentation
+  url: https://github.com/Tecnativa/docker-socket-proxy
+compliance: []
+faq:
+  - question: "Why is mounting docker.sock dangerous?"
+    answer: "The Docker socket gives unrestricted access to the Docker daemon. A container with the socket mounted can create privileged containers, access host filesystems, and effectively gain root on the host."
+  - question: "What if I need Docker-in-Docker for CI/CD?"
+    answer: "Use Docker-in-Docker (dind) with TLS enabled, or use Kaniko/Buildah for building images without requiring Docker socket access."
+similar_rules: []
+tests:
+  positive: tests/positive/
+  negative: tests/negative/

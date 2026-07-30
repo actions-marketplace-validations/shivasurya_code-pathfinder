@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -38,16 +39,14 @@ func GenerateSha256(input string) string {
 
 // appendUnique appends a node to a slice only if it's not already present.
 func appendUnique(slice []*Node, node *Node) []*Node {
-	for _, n := range slice {
-		if n == node {
-			return slice
-		}
+	if slices.Contains(slice, node) {
+		return slice
 	}
 	return append(slice, node)
 }
 
 // FormatType formats various types to string representation.
-func FormatType(v interface{}) string {
+func FormatType(v any) string {
 	switch val := v.(type) {
 	case string:
 		return val
@@ -55,7 +54,7 @@ func FormatType(v interface{}) string {
 		return fmt.Sprintf("%d", val)
 	case float32, float64:
 		return fmt.Sprintf("%.2f", val)
-	case []interface{}:
+	case []any:
 		//nolint:all
 		jsonBytes, _ := json.Marshal(val)
 		return string(jsonBytes)
@@ -70,14 +69,14 @@ func EnableVerboseLogging() {
 }
 
 // Log logs a message if verbose logging is enabled.
-func Log(message string, args ...interface{}) {
+func Log(message string, args ...any) {
 	if verboseFlag {
 		log.Println(message, args)
 	}
 }
 
 // Fmt prints formatted output if verbose logging is enabled.
-func Fmt(format string, args ...interface{}) {
+func Fmt(format string, args ...any) {
 	if verboseFlag {
 		fmt.Printf(format, args...)
 	}
@@ -90,8 +89,8 @@ func IsGitHubActions() bool {
 
 // extractVisibilityModifier extracts visibility modifier from a string of modifiers.
 func extractVisibilityModifier(modifiers string) string {
-	words := strings.Fields(modifiers)
-	for _, word := range words {
+	words := strings.FieldsSeq(modifiers)
+	for word := range words {
 		switch word {
 		case "public", "private", "protected":
 			return word
@@ -108,6 +107,11 @@ func isJavaSourceFile(filename string) bool {
 // isPythonSourceFile checks if a file is a Python source file.
 func isPythonSourceFile(filename string) bool {
 	return filepath.Ext(filename) == ".py"
+}
+
+// isGoSourceFile checks if a file is a Go source file.
+func isGoSourceFile(filename string) bool {
+	return filepath.Ext(filename) == ".go"
 }
 
 //nolint:all
@@ -237,44 +241,110 @@ func extractMethodName(node *sitter.Node, sourceCode []byte, filepath string) (s
 	columnNumber := int(node.StartPoint().Column) + 1
 	// convert to string and merge
 	content += " " + strconv.Itoa(lineNumber) + ":" + strconv.Itoa(columnNumber)
-	
+
 	// Prefix method declarations to avoid ID collisions with invocations
 	prefix := ""
 	if node.Type() == "method_declaration" {
 		prefix = "method:"
 	}
-	
+
 	methodID = GenerateMethodID(prefix+methodName, parameters, filepath+"/"+content)
 	return methodName, methodID
 }
 
-// getFiles walks through a directory and returns all source files (Java, Python, Dockerfile, docker-compose).
-func getFiles(directory string) ([]string, error) {
+// getFiles walks through a directory and returns all source files (Java, Python, Go, C/C++, Dockerfile, docker-compose)
+// along with a ProjectStats summary of every file the walk observed (both
+// supported and unsupported).
+//
+// It skips vendor/, testdata/, node_modules/, .git/, common C/C++ build artifact directories,
+// directories starting with "_", and any path covered by excludePatterns. Files inside skipped
+// directories are not counted in ProjectStats either: the stats reflect "files the user expected
+// pathfinder to look at," not every regular file on disk.
+//
+// excludePatterns is a list of normalized, repo-relative path prefixes (no leading or trailing slash).
+// A path is skipped when its repo-relative form starts with "<prefix>/", or equals the prefix exactly.
+func getFiles(directory string, excludePatterns []string) ([]string, ProjectStats, error) {
 	var files []string
+	var stats ProjectStats
 	err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			// append java, python, dockerfile, and docker-compose files
-			ext := filepath.Ext(path)
-			base := filepath.Base(path)
-			baseLower := strings.ToLower(base)
 
-			switch {
-			case ext == ".java" || ext == ".py":
-				files = append(files, path)
-			case strings.HasPrefix(baseLower, "dockerfile"):
-				// Match Dockerfile, Dockerfile.dev, dockerfile, etc.
-				files = append(files, path)
-			case strings.Contains(baseLower, "docker-compose") && (ext == ".yml" || ext == ".yaml"):
-				// Match docker-compose.yml, docker-compose.yaml, etc.
-				files = append(files, path)
+		// Compute repo-relative path once so both directory and file checks can
+		// use it. filepath.Walk guarantees `path` is rooted at `directory`, so
+		// filepath.Rel cannot fail here in practice; we ignore its error.
+		relPath, _ := filepath.Rel(directory, path)
+		relSlash := filepath.ToSlash(relPath)
+
+		// Apply user-specified exclude patterns before any other check.
+		if len(excludePatterns) > 0 && isExcludedPath(relSlash, excludePatterns) {
+			if info.IsDir() {
+				return filepath.SkipDir
 			}
+			return nil
 		}
+
+		// Skip directories that should never be scanned
+		if info.IsDir() {
+			name := info.Name()
+			switch name {
+			case "vendor", "testdata", "node_modules", ".git",
+				"build", "cmake-build-debug", "cmake-build-release",
+				"third_party", "external", "obj", "bin", "dist", ".cache":
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(name, "_") || strings.HasPrefix(name, "cmake-build-") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// append java, python, go, c/c++, dockerfile, and docker-compose files
+		ext := filepath.Ext(path)
+		base := filepath.Base(path)
+		baseLower := strings.ToLower(base)
+
+		var supported bool
+		switch {
+		case ext == ".java" || ext == ".py" || ext == ".go":
+			files = append(files, path)
+			supported = true
+		case ext == ".c" || ext == ".h":
+			files = append(files, path)
+			supported = true
+		case ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
+			ext == ".hpp" || ext == ".hh" || ext == ".hxx":
+			files = append(files, path)
+			supported = true
+		case strings.HasPrefix(baseLower, "dockerfile"):
+			// Match Dockerfile, Dockerfile.dev, dockerfile, etc.
+			files = append(files, path)
+			supported = true
+		case strings.Contains(baseLower, "docker-compose") && (ext == ".yml" || ext == ".yaml"):
+			// Match docker-compose.yml, docker-compose.yaml, etc.
+			files = append(files, path)
+			supported = true
+		}
+		stats.recordFile(path, supported)
 		return nil
 	})
-	return files, err
+	return files, stats, err
+}
+
+// isExcludedPath reports whether relPath (forward-slash, repo-relative) is covered
+// by any of the given prefix patterns. A match requires that relPath equals the
+// pattern exactly, or that relPath begins with "<pattern>/", so that "rules" covers
+// "rules/foo.py" but not "rulesx/foo.py".
+func isExcludedPath(relPath string, patterns []string) bool {
+	for _, p := range patterns {
+		if p == "" {
+			continue
+		}
+		if relPath == p || strings.HasPrefix(relPath, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // readFile reads the contents of a file.

@@ -31,7 +31,7 @@ golangci-lint run
 ./build/go/pathfinder serve --project <path>
 ./build/go/pathfinder serve --http --address :8080 --project <path>
 
-# Scan mode (using Python DSL rules)
+# Scan mode (using Python SDK rules)
 ./build/go/pathfinder scan --project <path> --ruleset <path_to_rules>
 
 # CI mode (loads rules from remote/local, outputs SARIF/JSON/CSV)
@@ -65,7 +65,7 @@ Type Inference Engine (bidirectional, return types, variable assignments)
     ↓
 Call Graph Builder (5-pass algorithm)
     ↓
-MCP Server / Python DSL Rules
+MCP Server / Python SDK Rules
     ↓
 Output Formats (JSON, SARIF, CSV, Text)
 ```
@@ -234,9 +234,9 @@ This project **requires CGO** due to `go-tree-sitter` C bindings. Build fails wi
 - Variable assignments (no type information)
 - Simplified compared to Java (no invocation linking yet)
 
-## Python DSL Rules (v1.0.0+)
+## Python SDK Rules (v1.0.0+)
 
-Code Pathfinder uses **Python DSL** for writing security rules. Rules are Python functions that query the call graph using the MCP interface.
+Code Pathfinder uses **Python SDK** for writing security rules. Rules are Python functions that query the call graph using the MCP interface.
 
 ### Example Rule
 ```python
@@ -356,6 +356,15 @@ expr.Run(program, envMap) // Returns bool
 
 Methods are bound at runtime to actual node fields, enabling type-safe queries without reflection.
 
+### Diff-Aware Scanning (`pathfinder ci --base`)
+CI mode filters findings to files touched by the PR. The wire is:
+
+1. `diff.GetChangedFiles()` runs `git diff --name-only --diff-filter=ACMRD <merge-base>..HEAD`.
+2. The flag set is **ACMRD** (Added, Copied, Modified, Renamed, **Deleted**). Deletions matter because the downstream filter at `cmd/ci.go` uses the list as a sentinel — an empty list means "no source in the diff," which a deletion-only PR would otherwise look identical to.
+3. `cmd/ci.go` applies `output.NewDiffFilter(changedFiles)` whenever `diffEnabled`, **without** a `len(changedFiles) > 0` guard. An empty diff intersection returns zero findings; it does NOT fall back to a full-repo scan. Falling back was the May 2026 regression that surfaced as 207 findings on a PR that only deleted a YAML workflow file.
+
+If you ever need to bring back the full-scan fallback (e.g., for `--no-diff`), do it by turning off `diffEnabled` rather than by smuggling logic into the filter guard. The two states must stay separable: "diff-aware on, nothing matched" vs "diff-aware off, scan everything."
+
 ### SARIF Report Generation
 CI mode generates SARIF reports for GitHub Advanced Security:
 ```go
@@ -431,4 +440,4 @@ Releases must include binaries for linux-amd64, darwin-amd64, darwin-arm64, and 
 1. Use `--verbose` flag to see indexing statistics
 2. Large projects benefit from more CPU cores (PATHFINDER_MAX_WORKERS env var)
 3. MCP queries are fast (index pre-built)
-4. Python DSL rules run sequentially - keep rules focused
+4. Python SDK rules run sequentially - keep rules focused

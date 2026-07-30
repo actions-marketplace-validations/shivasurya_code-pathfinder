@@ -40,7 +40,37 @@ func (e *Enricher) EnrichDetection(detection dsl.DataflowDetection, rule dsl.Rul
 	loc := e.extractLocation(detection)
 	enriched.Location = loc
 
-	// Extract code snippet
+	// Resolve source/sink file paths for taint flows
+	if enriched.DetectionType == dsl.DetectionTypeTaintLocal || enriched.DetectionType == dsl.DetectionTypeTaintGlobal {
+		// Sink file = finding location file (already resolved)
+		enriched.Detection.SinkFile = loc.RelPath
+		if enriched.Detection.SinkFile == "" {
+			enriched.Detection.SinkFile = loc.FilePath
+		}
+
+		// Source file: use SourceFunctionFQN if different from FunctionFQN
+		if detection.SourceFunctionFQN != "" && detection.SourceFunctionFQN != detection.FunctionFQN {
+			sourceLoc := e.extractLocation(dsl.DataflowDetection{
+				FunctionFQN: detection.SourceFunctionFQN,
+				SinkLine:    detection.SourceLine,
+			})
+			enriched.Detection.SourceFile = sourceLoc.RelPath
+			if enriched.Detection.SourceFile == "" {
+				enriched.Detection.SourceFile = sourceLoc.FilePath
+			}
+			// Store resolved source location for display
+			enriched.SourceLocation = sourceLoc
+			// Extract source code snippet for inter-procedural display
+			if srcSnippet, err := e.extractSnippet(sourceLoc); err == nil {
+				enriched.SourceSnippet = srcSnippet
+			}
+		} else {
+			// Same file for source and sink
+			enriched.Detection.SourceFile = enriched.Detection.SinkFile
+		}
+	}
+
+	// Extract code snippet (sink)
 	snippet, err := e.extractSnippet(loc)
 	if err == nil {
 		enriched.Snippet = snippet
@@ -107,6 +137,48 @@ func (e *Enricher) fallbackLocation(detection dsl.DataflowDetection) dsl.Locatio
 		Function: extractFunctionFromFQN(detection.FunctionFQN),
 	}
 
+	// If FQN is already a file path (e.g. container rules use file path as FQN),
+	// use it directly.
+	if strings.Contains(detection.FunctionFQN, "/") || strings.Contains(detection.FunctionFQN, string(filepath.Separator)) {
+		if _, err := os.Stat(detection.FunctionFQN); err == nil {
+			loc.FilePath = detection.FunctionFQN
+			if e.options.ProjectRoot != "" {
+				if relPath, err := filepath.Rel(e.options.ProjectRoot, detection.FunctionFQN); err == nil {
+					loc.RelPath = relPath
+				}
+			}
+			return loc
+		}
+	}
+
+	// C/C++ FQN format: "<relative/path>::<funcname>" or
+	// "<relative/path>::<ns>::<class>::<method>". The first `::`-segment
+	// is the project-relative source path; everything after is the
+	// scope chain. Resolve the file path against the project root and
+	// extract the function name from the trailing component.
+	if strings.Contains(detection.FunctionFQN, "::") {
+		segments := strings.SplitN(detection.FunctionFQN, "::", 2)
+		relFile := segments[0]
+		if relFile != "" {
+			candidate := relFile
+			if e.options.ProjectRoot != "" {
+				candidate = filepath.Join(e.options.ProjectRoot, relFile)
+			}
+			if _, err := os.Stat(candidate); err == nil {
+				loc.FilePath = candidate
+				loc.RelPath = relFile
+				if len(segments) > 1 {
+					tail := strings.Split(segments[1], "::")
+					loc.Function = tail[len(tail)-1]
+					if len(tail) >= 2 {
+						loc.ClassName = tail[len(tail)-2]
+					}
+				}
+				return loc
+			}
+		}
+	}
+
 	// Try to extract file path from FQN
 	// Format: module.submodule.function or package.Class.method
 	parts := strings.Split(detection.FunctionFQN, ".")
@@ -118,11 +190,42 @@ func (e *Enricher) fallbackLocation(detection dsl.DataflowDetection) dsl.Locatio
 		}
 	}
 
+	// Try to resolve file path from FQN by converting module path to file path.
+	// e.g. "app.views.login" → "app/views.py" or "com.example.Main.run" → "com/example/Main.java"
+	if e.options.ProjectRoot != "" && len(parts) > 1 {
+		moduleParts := parts[:len(parts)-1] // Drop function name
+		modulePath := filepath.Join(e.options.ProjectRoot, filepath.Join(moduleParts...))
+		// Try common source file extensions
+		for _, ext := range []string{".py", ".java", ".go", ".js", ".ts", ".rb"} {
+			candidate := modulePath + ext
+			if _, err := os.Stat(candidate); err == nil {
+				loc.FilePath = candidate
+				if relPath, err := filepath.Rel(e.options.ProjectRoot, candidate); err == nil {
+					loc.RelPath = relPath
+				}
+				break
+			}
+		}
+	}
+
 	return loc
 }
 
-// extractFunctionFromFQN extracts function name from fully qualified name.
+// extractFunctionFromFQN extracts the bare function name from a fully
+// qualified name. Two FQN shapes are supported:
+//
+//   - Dot-separated (Python, Go, Java): "pkg.Mod.func"  → "func"
+//   - C/C++ scope-resolved:             "src/main.c::main",
+//     "src/utils.cpp::ns::Class::method" → "main", "method"
+//
+// The C/C++ form is detected by the presence of "::" — C/C++ FQNs
+// always contain at least one because the prefix is itself a path
+// segment joined to the symbol with "::".
 func extractFunctionFromFQN(fqn string) string {
+	if strings.Contains(fqn, "::") {
+		parts := strings.Split(fqn, "::")
+		return parts[len(parts)-1]
+	}
 	parts := strings.Split(fqn, ".")
 	if len(parts) > 0 {
 		return parts[len(parts)-1]
@@ -152,14 +255,8 @@ func (e *Enricher) extractSnippet(loc dsl.LocationInfo) (dsl.CodeSnippet, error)
 		contextLines = 3
 	}
 
-	startLine := loc.Line - contextLines
-	if startLine < 1 {
-		startLine = 1
-	}
-	endLine := loc.Line + contextLines
-	if endLine > len(lines) {
-		endLine = len(lines)
-	}
+	startLine := max(loc.Line-contextLines, 1)
+	endLine := min(loc.Line+contextLines, len(lines))
 
 	snippet.StartLine = startLine
 

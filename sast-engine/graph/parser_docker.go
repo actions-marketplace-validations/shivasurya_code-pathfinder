@@ -2,7 +2,9 @@ package graph
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/docker"
 )
@@ -50,12 +52,27 @@ func convertDockerInstructionToNode(dockerNode *docker.DockerfileNode, filePath 
 			StartByte: 0, // Will be set if we need lazy loading
 			EndByte:   0,
 		},
+		Metadata: make(map[string]any),
 	}
 
 	// Store instruction-specific details in MethodArgumentsValue
 	// This allows DSL rules to query instruction arguments
 	node.MethodArgumentsValue = append(node.MethodArgumentsValue,
 		extractDockerInstructionArgs(dockerNode)...)
+
+	// Store stage information for multi-stage Dockerfiles
+	if dockerNode.InstructionType == "FROM" {
+		node.Metadata["stage_index"] = dockerNode.StageIndex
+		if dockerNode.StageAlias != "" {
+			node.Metadata["stage_name"] = dockerNode.StageAlias
+		}
+	}
+
+	// Track COPY --from dependencies
+	if dockerNode.InstructionType == "COPY" && dockerNode.CopyFrom != "" {
+		node.Metadata["copy_from"] = dockerNode.CopyFrom
+		node.Metadata["stage_index"] = dockerNode.StageIndex
+	}
 
 	return node
 }
@@ -173,11 +190,24 @@ func convertComposeServiceToNode(serviceName string, serviceNode *YAMLNode, file
 			StartByte: 0,
 			EndByte:   0,
 		},
+		Metadata: make(map[string]any),
 	}
 
 	// Extract service properties and store in MethodArgumentsValue
 	// This allows DSL rules to query service configuration
 	node.MethodArgumentsValue = extractComposeServiceProperties(serviceNode)
+
+	// Extract and store depends_on in Metadata for dependency graph traversal
+	depends := []any{}
+	for _, prop := range node.MethodArgumentsValue {
+		if after, ok := strings.CutPrefix(prop, "depends_on="); ok {
+			depends = append(depends, after)
+		}
+	}
+	if len(depends) > 0 {
+		node.Metadata["depends_on"] = depends
+	}
+	node.Metadata["service_type"] = "compose_service"
 
 	return node
 }
@@ -263,6 +293,46 @@ func extractComposeServiceProperties(serviceNode *YAMLNode) []string {
 		}
 	}
 
+	// Extract depends_on (for dependency graph)
+	if dependsNode := serviceNode.GetChild("depends_on"); dependsNode != nil {
+		// depends_on can be array format: ["db", "redis"]
+		// or object format: {db: {condition: service_healthy}}
+		dependsList := []string{}
+
+		// Handle array format
+		for _, dep := range dependsNode.ListValues() {
+			if depStr, ok := dep.(string); ok {
+				dependsList = append(dependsList, depStr)
+			}
+		}
+
+		// Handle object format (keys are service names)
+		if dependsNode.Children != nil {
+			for serviceName := range dependsNode.Children {
+				// Avoid duplicates from array format
+				found := slices.Contains(dependsList, serviceName)
+				if !found {
+					dependsList = append(dependsList, serviceName)
+				}
+			}
+		}
+
+		// Store in properties
+		for _, dep := range dependsList {
+			props = append(props, "depends_on="+dep)
+		}
+	}
+
+	// Extract build context (for dependency analysis)
+	if buildNode := serviceNode.GetChild("build"); buildNode != nil {
+		// build can be string (context path) or object
+		if buildStr := buildNode.StringValue(); buildStr != "" {
+			props = append(props, "build="+buildStr)
+		} else if contextNode := buildNode.GetChild("context"); contextNode != nil {
+			props = append(props, "build="+contextNode.StringValue())
+		}
+	}
+
 	return props
 }
 
@@ -291,12 +361,7 @@ func HasDockerInstructionArg(node *Node, arg string) bool {
 	if !IsDockerNode(node) {
 		return false
 	}
-	for _, value := range node.MethodArgumentsValue {
-		if value == arg {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(node.MethodArgumentsValue, arg)
 }
 
 // GetComposeServiceProperty gets a property value from a compose service node.
@@ -332,10 +397,5 @@ func HasComposeServiceProperty(node *Node, property string, expectedValue ...str
 
 	// Check for specific value
 	expected := property + "=" + expectedValue[0]
-	for _, value := range node.MethodArgumentsValue {
-		if value == expected {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(node.MethodArgumentsValue, expected)
 }

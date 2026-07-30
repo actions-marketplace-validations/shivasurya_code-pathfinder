@@ -7,7 +7,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/clike"
 	sitter "github.com/smacker/go-tree-sitter"
+	clang "github.com/smacker/go-tree-sitter/c"
+	cpplang "github.com/smacker/go-tree-sitter/cpp"
+	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/python"
 )
@@ -18,6 +22,10 @@ type ProgressCallbacks struct {
 	OnStart func(totalFiles int)
 	// OnProgress is called after each file is processed (successfully or with error).
 	OnProgress func()
+	// ExcludePatterns holds validated, normalized repo-relative path prefixes.
+	// A file is skipped during the walk if its repo-relative path starts with any prefix.
+	// Use validateExcludePatterns in the cmd package to produce this slice.
+	ExcludePatterns []string
 }
 
 // Initialize initializes the code graph by parsing all source files in a directory.
@@ -26,7 +34,12 @@ func Initialize(directory string, callbacks *ProgressCallbacks) *CodeGraph {
 	codeGraph := NewCodeGraph()
 	start := time.Now()
 
-	files, err := getFiles(directory)
+	var excludePatterns []string
+	if callbacks != nil {
+		excludePatterns = callbacks.ExcludePatterns
+	}
+	files, stats, err := getFiles(directory, excludePatterns)
+	codeGraph.ProjectStats = stats
 	if err != nil {
 		//nolint:all
 		Log("Directory not found:", err)
@@ -89,16 +102,27 @@ func Initialize(directory string, callbacks *ProgressCallbacks) *CodeGraph {
 				continue
 			}
 
-			// Handle tree-sitter based parsing for Java and Python
-			switch fileExt {
-			case ".java":
+			// For .h files, classify as C vs C++ once and cache the result so
+			// per-AST-node language checks remain zero-I/O during traversal.
+			if fileExt == ".h" {
+				clike.CacheHeaderLanguage(file, clike.DetectCppInHeader(file))
+			}
+
+			// Handle tree-sitter based parsing for Java, Python, Go, C, and C++.
+			// C/C++ cases come first because .h is shared across both grammars and
+			// must route via the cached heuristic, not a simple extension match.
+			switch {
+			case clike.IsCSourceFile(file):
+				parser.SetLanguage(clang.GetLanguage())
+			case clike.IsCppSourceFile(file):
+				parser.SetLanguage(cpplang.GetLanguage())
+			case fileExt == ".java":
 				parser.SetLanguage(java.GetLanguage())
-			case ".py":
+			case fileExt == ".py":
 				parser.SetLanguage(python.GetLanguage())
+			case fileExt == ".go":
+				parser.SetLanguage(golang.GetLanguage())
 			default:
-				// NOTE: This case is currently unreachable because getFiles() only returns
-				// .java, .py, Dockerfile*, and docker-compose* files. This exists as defensive
-				// programming in case getFiles() is modified to include additional file types.
 				Log("Unsupported file type:", file)
 				if callbacks != nil && callbacks.OnProgress != nil {
 					callbacks.OnProgress()
@@ -139,7 +163,7 @@ func Initialize(directory string, callbacks *ProgressCallbacks) *CodeGraph {
 
 	// Start workers
 	wg.Add(numWorkers)
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		go worker()
 	}
 
@@ -155,14 +179,17 @@ func Initialize(directory string, callbacks *ProgressCallbacks) *CodeGraph {
 		close(resultChan)
 	}()
 
-	// Collect results
+	// Collect results.
+	// Each worker already populated edge.From.OutgoingEdges via localGraph.AddEdge,
+	// and node pointers are shared across local/global graphs, so we transfer the
+	// edge structs without re-attaching them — calling codeGraph.AddEdge here would
+	// double every entry in OutgoingEdges and break callers that walk it (e.g. the
+	// C/C++ call-graph builders).
 	for localGraph := range resultChan {
 		for _, node := range localGraph.Nodes {
 			codeGraph.AddNode(node)
 		}
-		for _, edge := range localGraph.Edges {
-			codeGraph.AddEdge(edge.From, edge.To)
-		}
+		codeGraph.Edges = append(codeGraph.Edges, localGraph.Edges...)
 	}
 
 	// Resolve transitive inheritance for Python classes.

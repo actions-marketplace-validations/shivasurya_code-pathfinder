@@ -1,12 +1,20 @@
 package cmd
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph"
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/builder"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/resolution"
 	"github.com/shivasurya/code-pathfinder/sast-engine/output"
 	"github.com/spf13/cobra"
 )
@@ -20,11 +28,14 @@ var resolutionReportCmd = &cobra.Command{
   - Overall resolution statistics (resolved vs unresolved)
   - Breakdown by failure category
   - Top unresolved patterns with occurrence counts
+  - Per-file unresolved call breakdown
 
-This helps identify why calls are not being resolved and prioritize
-improvements to the resolution logic.`,
+Use --csv to export unresolved calls with file, line, target, and reason.`,
 	Run: func(cmd *cobra.Command, _ []string) {
 		projectInput := cmd.Flag("project").Value.String()
+		csvOutput := cmd.Flag("csv").Value.String()
+		dumpJSON := cmd.Flag("dump-callsites-json").Value.String()
+		enableDBCache, _ := cmd.Flags().GetBool("enable-db-cache")
 
 		if projectInput == "" {
 			fmt.Println("Error: --project flag is required")
@@ -35,17 +46,57 @@ improvements to the resolution logic.`,
 		codeGraph := graph.Initialize(projectInput, nil)
 
 		fmt.Println("Building call graph...")
-		cg, registry, _, err := callgraph.InitializeCallGraph(codeGraph, projectInput, output.NewLogger(output.VerbosityDefault))
+		logger := output.NewLogger(output.VerbosityDefault)
+		cg, modReg, _, err := callgraph.InitializeCallGraph(codeGraph, projectInput, logger)
 		if err != nil {
 			fmt.Printf("Error building call graph: %v\n", err)
 			return
 		}
 
+		// Build Go call graph if go.mod exists (same pipeline as scan.go).
+		goModPath := filepath.Join(projectInput, "go.mod")
+		if _, statErr := os.Stat(goModPath); statErr == nil {
+			goRegistry, goErr := resolution.BuildGoModuleRegistry(projectInput)
+			if goErr == nil && goRegistry != nil {
+				builder.InitGoStdlibLoader(goRegistry, projectInput, logger)
+				builder.InitGoThirdPartyLoader(goRegistry, projectInput, false, logger)
+				goTypeEngine := resolution.NewGoTypeInferenceEngine(goRegistry)
+
+				// Open SQLite analysis cache only when --enable-db-cache is set.
+				// Disabled by default to preserve current behaviour.
+				var analysisCache *builder.AnalysisCache
+				if enableDBCache {
+					var cacheErr error
+					analysisCache, cacheErr = builder.OpenAnalysisCache(projectInput)
+					if cacheErr != nil {
+						fmt.Fprintf(os.Stderr, "  [cache] warn: could not open cache: %v — running full analysis\n", cacheErr)
+						analysisCache = nil
+					}
+					if analysisCache != nil {
+						defer analysisCache.Close()
+					}
+				}
+
+				goCG, goErr := builder.BuildGoCallGraph(codeGraph, goRegistry, goTypeEngine, logger, analysisCache)
+				if goErr == nil && goCG != nil {
+					builder.MergeCallGraphs(cg, goCG)
+				}
+
+				if enableDBCache && analysisCache != nil {
+					fmt.Println("Cache: incremental analysis cache updated")
+				}
+			}
+		}
+
+		// Reuse scan.go's helper so both commands stay aligned. It gates
+		// each builder on hasLanguageNodes and merges into cg in place.
+		buildClikeCallGraphs(cg, codeGraph, projectInput, logger)
+
 		fmt.Printf("\nResolution Report for %s\n", projectInput)
 		fmt.Println("===============================================")
 
 		// Collect statistics
-		stats := aggregateResolutionStatistics(cg)
+		stats := aggregateResolutionStatistics(cg, projectInput)
 
 		// Print overall statistics
 		printOverallStatistics(stats)
@@ -63,16 +114,55 @@ improvements to the resolution logic.`,
 			fmt.Println()
 		}
 
+		// Print Go resolution statistics
+		if stats.GoTotalCalls > 0 {
+			printGoResolutionStatistics(stats)
+			fmt.Println()
+		}
+
 		// Print failure breakdown
 		printFailureBreakdown(stats)
+		fmt.Println()
+
+		// Print per-file breakdown
+		printPerFileBreakdown(stats, 15)
 		fmt.Println()
 
 		// Print top unresolved patterns
 		printTopUnresolvedPatterns(stats, 20)
 		fmt.Println()
 
-		fmt.Printf("Module registry: %d modules\n", len(registry.Modules))
+		fmt.Printf("Module registry: %d modules\n", len(modReg.Modules))
+
+		// Export CSV if requested
+		if csvOutput != "" {
+			if err := exportUnresolvedCSV(stats, csvOutput); err != nil {
+				fmt.Printf("Error writing CSV: %v\n", err)
+			} else {
+				fmt.Printf("\nExported %d unresolved calls to %s\n", len(stats.UnresolvedDetails), csvOutput)
+			}
+		}
+
+		// Export call sites JSON for validation against ground truth
+		if dumpJSON != "" {
+			if err := dumpCallSitesJSON(cg, dumpJSON); err != nil {
+				fmt.Printf("Error writing call sites JSON: %v\n", err)
+			} else {
+				fmt.Printf("\nExported call sites to %s\n", dumpJSON)
+			}
+		}
 	},
+}
+
+// unresolvedDetail captures full context for a single unresolved call site.
+type unresolvedDetail struct {
+	File          string // Relative file path
+	Line          int
+	Column        int
+	FunctionFQN   string // Containing function
+	Target        string // Call target as written
+	TargetFQN     string // Attempted FQN resolution
+	FailureReason string // Category
 }
 
 // resolutionStatistics holds aggregated statistics about call resolution.
@@ -80,10 +170,12 @@ type resolutionStatistics struct {
 	TotalCalls       int
 	ResolvedCalls    int
 	UnresolvedCalls  int
-	FailuresByReason map[string]int                // Category -> count
-	PatternCounts    map[string]int                // Target pattern -> count
-	FrameworkCounts  map[string]int                // Framework prefix -> count (for external_framework category)
-	UnresolvedByFQN  map[string]core.CallSite // For detailed inspection
+	FailuresByReason map[string]int            // Category -> count
+	PatternCounts    map[string]int            // Target pattern -> count
+	FrameworkCounts  map[string]int            // Framework prefix -> count (for external_framework category)
+	UnresolvedByFQN  map[string]core.CallSite  // For detailed inspection (legacy)
+	UnresolvedByFile map[string]int            // Relative file path -> count
+	UnresolvedDetails []unresolvedDetail       // Full per-call-site details
 
 	// Phase 2: Type inference statistics
 	TypeInferenceResolved  int            // Calls resolved via type inference
@@ -101,25 +193,72 @@ type resolutionStatistics struct {
 	StdlibViaAnnotation int            // Resolved via type annotations
 	StdlibViaInference  int            // Resolved via type inference
 	StdlibViaBuiltin    int            // Resolved via builtin registry
+
+	// Go resolution statistics
+	GoTotalCalls         int
+	GoResolvedCalls      int
+	GoUnresolvedCalls    int
+	GoUserCodeResolved   int            // Resolved via user-code call graph (Check 1)
+	GoStdlibResolved     int            // Resolved via StdlibLoader (Check 2)
+	GoThirdPartyResolved int            // Resolved via ThirdPartyLoader (Check 2.5)
+	GoStdlibByModule     map[string]int // e.g., "net/http" -> 12
+	GoThirdPartyByModule map[string]int // e.g., "gorm.io/gorm" -> 5
 }
 
 // aggregateResolutionStatistics analyzes the call graph and collects statistics.
-func aggregateResolutionStatistics(cg *core.CallGraph) *resolutionStatistics {
+func aggregateResolutionStatistics(cg *core.CallGraph, projectRoot string) *resolutionStatistics {
 	stats := &resolutionStatistics{
 		FailuresByReason:       make(map[string]int),
 		PatternCounts:          make(map[string]int),
 		FrameworkCounts:        make(map[string]int),
 		UnresolvedByFQN:        make(map[string]core.CallSite),
+		UnresolvedByFile:       make(map[string]int),
 		TypesBySource:          make(map[string]int),
 		ConfidenceDistribution: make(map[string]int),
 		StdlibByModule:         make(map[string]int),
 		StdlibByType:           make(map[string]int),
+		GoStdlibByModule:       make(map[string]int),
+		GoThirdPartyByModule:   make(map[string]int),
 	}
 
 	// Iterate through all call sites
-	for _, callSites := range cg.CallSites {
+	for functionFQN, callSites := range cg.CallSites {
 		for _, site := range callSites {
 			stats.TotalCalls++
+
+			// Classify Go call sites: check caller function language or FQN heuristic.
+			// Go FQNs always contain "/" (e.g., "net/http.Request.FormValue").
+			// Caller function node language is the authoritative signal when available.
+			funcNode := cg.Functions[functionFQN]
+			isGoCall := (funcNode != nil && funcNode.Language == "go") ||
+				strings.Contains(site.TargetFQN, "/")
+
+			if isGoCall {
+				stats.GoTotalCalls++
+				if site.Resolved {
+					stats.GoResolvedCalls++
+					// Use site.IsStdlib (set by go_builder.go) as the authoritative stdlib signal.
+					// It correctly handles single-segment stdlib packages (fmt, os, sync, io).
+					switch {
+					case site.IsStdlib:
+						stats.GoStdlibResolved++
+						goModule := extractGoModuleName(site.TargetFQN)
+						if goModule != "" {
+							stats.GoStdlibByModule[goModule]++
+						}
+					case site.TypeSource == "thirdparty_local" || site.TypeSource == "thirdparty_cdn":
+						stats.GoThirdPartyResolved++
+						goModule := extractGoModuleName(site.TargetFQN)
+						if goModule != "" {
+							stats.GoThirdPartyByModule[goModule]++
+						}
+					default:
+						stats.GoUserCodeResolved++
+					}
+				} else {
+					stats.GoUnresolvedCalls++
+				}
+			}
 
 			if site.Resolved {
 				stats.ResolvedCalls++
@@ -184,19 +323,33 @@ func aggregateResolutionStatistics(cg *core.CallGraph) *resolutionStatistics {
 			} else {
 				stats.UnresolvedCalls++
 
-				// Count by failure reason
-				if site.FailureReason != "" {
-					stats.FailuresByReason[site.FailureReason]++
-				} else {
-					stats.FailuresByReason["uncategorized"]++
+				// Determine failure reason
+				reason := site.FailureReason
+				if reason == "" {
+					reason = "uncategorized"
 				}
+				stats.FailuresByReason[reason]++
 
 				// Count pattern occurrences
 				stats.PatternCounts[site.Target]++
 
+				// Track per-file
+				relFile := relativePath(site.Location.File, projectRoot)
+				stats.UnresolvedByFile[relFile]++
+
+				// Store full detail for CSV export
+				stats.UnresolvedDetails = append(stats.UnresolvedDetails, unresolvedDetail{
+					File:          relFile,
+					Line:          site.Location.Line,
+					Column:        site.Location.Column,
+					FunctionFQN:   functionFQN,
+					Target:        site.Target,
+					TargetFQN:     site.TargetFQN,
+					FailureReason: reason,
+				})
+
 				// For external frameworks, track which framework
 				if site.FailureReason == "external_framework" {
-					// Extract framework prefix (first component before dot)
 					for idx := 0; idx < len(site.TargetFQN); idx++ {
 						if site.TargetFQN[idx] == '.' {
 							framework := site.TargetFQN[:idx]
@@ -206,23 +359,38 @@ func aggregateResolutionStatistics(cg *core.CallGraph) *resolutionStatistics {
 					}
 				}
 
-				// Store for detailed inspection
+				// Store for detailed inspection (legacy)
 				stats.UnresolvedByFQN[site.TargetFQN] = site
 			}
 		}
 	}
 
+	// Sort unresolved details by file then line for stable output
+	sort.Slice(stats.UnresolvedDetails, func(i, j int) bool {
+		if stats.UnresolvedDetails[i].File != stats.UnresolvedDetails[j].File {
+			return stats.UnresolvedDetails[i].File < stats.UnresolvedDetails[j].File
+		}
+		return stats.UnresolvedDetails[i].Line < stats.UnresolvedDetails[j].Line
+	})
+
 	return stats
+}
+
+// relativePath computes a relative path from projectRoot, or returns the original on error.
+func relativePath(absPath, projectRoot string) string {
+	if absPath == "" || projectRoot == "" {
+		return absPath
+	}
+	rel, err := filepath.Rel(projectRoot, absPath)
+	if err != nil {
+		return absPath
+	}
+	return rel
 }
 
 // containsString checks if a string contains a substring.
 func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(s, substr)
 }
 
 // printOverallStatistics prints the overall resolution statistics.
@@ -357,6 +525,34 @@ func printFailureBreakdown(stats *resolutionStatistics) {
 	}
 }
 
+// printPerFileBreakdown prints files with the most unresolved calls.
+func printPerFileBreakdown(stats *resolutionStatistics, topN int) {
+	if len(stats.UnresolvedByFile) == 0 {
+		return
+	}
+
+	fmt.Printf("Top %d Files with Unresolved Calls:\n", topN)
+
+	type fileCount struct {
+		file  string
+		count int
+	}
+	files := make([]fileCount, 0, len(stats.UnresolvedByFile))
+	for file, count := range stats.UnresolvedByFile {
+		files = append(files, fileCount{file, count})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].count > files[j].count
+	})
+
+	for i, fc := range files {
+		if i >= topN {
+			break
+		}
+		fmt.Printf("  %2d. %-60s %d unresolved\n", i+1, fc.file, fc.count)
+	}
+}
+
 // printTopUnresolvedPatterns prints the most common unresolved patterns.
 func printTopUnresolvedPatterns(stats *resolutionStatistics, topN int) {
 	fmt.Printf("Top %d Unresolved Patterns:\n", topN)
@@ -383,12 +579,188 @@ func printTopUnresolvedPatterns(stats *resolutionStatistics, topN int) {
 	}
 }
 
+// callSiteRecord is the JSON record written by dumpCallSitesJSON.
+type callSiteRecord struct {
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+	Col        int    `json:"col"`
+	CallerFQN  string `json:"callerFqn"`
+	Target     string `json:"target"`
+	OurFQN     string `json:"ourFqn"`
+	Resolved   bool   `json:"resolved"`
+	TypeSource string `json:"typeSource,omitempty"` // e.g., "go_variable_binding", "thirdparty_local"
+	IsStdlib   bool   `json:"isStdlib,omitempty"`
+}
+
+// dumpCallSitesJSON writes all Go call sites (resolved + unresolved) to a JSONL file
+// so they can be compared against a ground-truth extractor (e.g., go/packages).
+func dumpCallSitesJSON(cg *core.CallGraph, outputPath string) error {
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create JSON file: %w", err)
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	written := 0
+
+	for callerFQN, sites := range cg.CallSites {
+		funcNode := cg.Functions[callerFQN]
+		// Only emit Go call sites
+		isGoFunc := funcNode != nil && funcNode.Language == "go"
+		if !isGoFunc {
+			continue
+		}
+		for _, site := range sites {
+			rec := callSiteRecord{
+				File:       site.Location.File,
+				Line:       site.Location.Line,
+				Col:        site.Location.Column,
+				CallerFQN:  callerFQN,
+				Target:     site.Target,
+				OurFQN:     site.TargetFQN,
+				Resolved:   site.Resolved,
+				TypeSource: site.TypeSource,
+				IsStdlib:   site.IsStdlib,
+			}
+			if err := enc.Encode(rec); err != nil {
+				return fmt.Errorf("failed to encode record: %w", err)
+			}
+			written++
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  wrote %d Go call site records\n", written)
+	return nil
+}
+
+// exportUnresolvedCSV writes all unresolved call sites to a CSV file.
+func exportUnresolvedCSV(stats *resolutionStatistics, outputPath string) error {
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file: %w", err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	// Header
+	if err := w.Write([]string{
+		"file", "line", "column", "function", "target", "target_fqn", "reason",
+	}); err != nil {
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Data rows (already sorted by file then line)
+	for _, d := range stats.UnresolvedDetails {
+		if err := w.Write([]string{
+			d.File,
+			strconv.Itoa(d.Line),
+			strconv.Itoa(d.Column),
+			d.FunctionFQN,
+			d.Target,
+			d.TargetFQN,
+			d.FailureReason,
+		}); err != nil {
+			return fmt.Errorf("failed to write CSV row: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // percentage calculates the percentage of part out of total.
 func percentage(part, total int) float64 {
 	if total == 0 {
 		return 0.0
 	}
 	return float64(part) * 100.0 / float64(total)
+}
+
+// extractGoModuleName extracts the Go module/package path from a fully-qualified name.
+// Examples:
+//
+//	"gorm.io/gorm.DB.Where"             -> "gorm.io/gorm"
+//	"net/http.Request.FormValue"         -> "net/http"
+//	"github.com/gin-gonic/gin.Context.Query" -> "github.com/gin-gonic/gin"
+//	"fmt.Println"                        -> "" (no slash, not a module path)
+func extractGoModuleName(fqn string) string {
+	lastSlash := strings.LastIndex(fqn, "/")
+	if lastSlash == -1 {
+		// No slash — single-segment stdlib package (fmt, os, sync).
+		// Cannot reliably extract a module path, so return empty.
+		return ""
+	}
+	// After the last slash find the first "." which separates package from type name.
+	rest := fqn[lastSlash+1:]
+	dotIdx := strings.Index(rest, ".")
+	if dotIdx == -1 {
+		return fqn
+	}
+	return fqn[:lastSlash+1+dotIdx]
+}
+
+// printTopModules prints the top N entries from a module→count map,
+// sorted by count descending.
+func printTopModules(modules map[string]int, topN int) {
+	type moduleCount struct {
+		module string
+		count  int
+	}
+	entries := make([]moduleCount, 0, len(modules))
+	for mod, count := range modules {
+		entries = append(entries, moduleCount{mod, count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].module < entries[j].module
+	})
+	for i, mc := range entries {
+		if i >= topN {
+			break
+		}
+		fmt.Printf("    %2d. %-40s %d calls\n", i+1, mc.module, mc.count)
+	}
+}
+
+// printGoResolutionStatistics prints the Go call graph resolution statistics.
+func printGoResolutionStatistics(stats *resolutionStatistics) {
+	fmt.Println("Go Resolution Statistics:")
+	fmt.Printf("  Total Go calls:       %d\n", stats.GoTotalCalls)
+	fmt.Printf("  Resolved:             %d (%.1f%%)\n",
+		stats.GoResolvedCalls,
+		percentage(stats.GoResolvedCalls, stats.GoTotalCalls))
+	fmt.Printf("  Unresolved:           %d (%.1f%%)\n",
+		stats.GoUnresolvedCalls,
+		percentage(stats.GoUnresolvedCalls, stats.GoTotalCalls))
+	fmt.Println()
+
+	if stats.GoResolvedCalls > 0 {
+		fmt.Println("  Resolution Breakdown:")
+		fmt.Printf("    User code:          %d (%.1f%%)\n",
+			stats.GoUserCodeResolved,
+			percentage(stats.GoUserCodeResolved, stats.GoResolvedCalls))
+		fmt.Printf("    Stdlib (CDN):       %d (%.1f%%)\n",
+			stats.GoStdlibResolved,
+			percentage(stats.GoStdlibResolved, stats.GoResolvedCalls))
+		fmt.Printf("    Third-party:        %d (%.1f%%)\n",
+			stats.GoThirdPartyResolved,
+			percentage(stats.GoThirdPartyResolved, stats.GoResolvedCalls))
+		fmt.Println()
+	}
+
+	if len(stats.GoStdlibByModule) > 0 {
+		fmt.Println("  Top Go Stdlib Modules:")
+		printTopModules(stats.GoStdlibByModule, 10)
+		fmt.Println()
+	}
+
+	if len(stats.GoThirdPartyByModule) > 0 {
+		fmt.Println("  Top Go Third-Party Modules:")
+		printTopModules(stats.GoThirdPartyByModule, 10)
+	}
 }
 
 // isStdlibResolution checks if a FQN resolves to Python stdlib.
@@ -561,4 +933,7 @@ func init() {
 	rootCmd.AddCommand(resolutionReportCmd)
 	resolutionReportCmd.Flags().StringP("project", "p", "", "Project root directory")
 	resolutionReportCmd.MarkFlagRequired("project")
+	resolutionReportCmd.Flags().String("csv", "", "Export unresolved calls to CSV file (e.g., --csv unresolved.csv)")
+	resolutionReportCmd.Flags().String("dump-callsites-json", "", "Export all Go call sites as JSONL for accuracy validation (e.g., --dump-callsites-json callsites.jsonl)")
+	resolutionReportCmd.Flags().Bool("enable-db-cache", false, "Enable SQLite-backed incremental analysis cache (experimental). Caches Pass 2b scopes and Pass 3 call sites per file keyed by content hash; only changed files are re-analysed on subsequent runs.")
 }

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +11,12 @@ import (
 
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
+	"github.com/shivasurya/code-pathfinder/sast-engine/updatecheck"
 )
+
+// mcpManifestURL overrides the CDN URL used by fetchUpdateInfo. Empty string
+// means use the updatecheck package default. Overridable in tests.
+var mcpManifestURL string
 
 // Server handles MCP protocol communication.
 type Server struct {
@@ -25,6 +31,38 @@ type Server struct {
 	degradation      *GracefulDegradation
 	analytics        *Analytics
 	disableAnalytics bool
+	version          string
+
+	// Go-specific context for stdlib metadata in MCP tool responses.
+	// Set via SetGoContext after the Go call graph is built.
+	goVersion        string
+	goModuleRegistry *core.GoModuleRegistry
+
+	// updateInfo is populated once at server construction via a synchronous
+	// updatecheck.Check call (5 s timeout). It is immutable for the lifetime
+	// of the process — no goroutine, no locking, no Close() needed.
+	updateInfo *updatecheck.Result
+
+	// reachReporter deduplicates analytics reach events within a 24-hour
+	// window. Initialized in both constructors alongside updateInfo.
+	reachReporter *updatecheck.ReachReporter
+}
+
+// SetVersion sets the server version reported in MCP initialize responses.
+// Should be called with cmd.Version (injected via ldflags at build time).
+func (s *Server) SetVersion(version string) {
+	s.version = version
+}
+
+// SetGoContext stores the Go version and module registry so that MCP tool
+// responses can include stdlib metadata (is_stdlib, signature, return_type,
+// etc.) for Go standard library calls.
+//
+// Must be called after InitGoStdlibLoader has populated reg.StdlibLoader.
+// Safe to skip — tools degrade gracefully when goModuleRegistry is nil.
+func (s *Server) SetGoContext(version string, reg *core.GoModuleRegistry) {
+	s.goVersion = version
+	s.goModuleRegistry = reg
 }
 
 // NewServer creates a new MCP server with the given index data.
@@ -54,7 +92,7 @@ func NewServer(
 	mcpAnalytics := NewAnalytics("stdio", disableAnalytics)
 	mcpAnalytics.ReportIndexingComplete(stats)
 
-	return &Server{
+	s := &Server{
 		projectPath:      projectPath,
 		pythonVersion:    pythonVersion,
 		callGraph:        callGraph,
@@ -66,7 +104,74 @@ func NewServer(
 		degradation:      NewGracefulDegradation(tracker),
 		analytics:        mcpAnalytics,
 		disableAnalytics: disableAnalytics,
+		reachReporter:    updatecheck.NewReachReporter(),
 	}
+	s.fetchUpdateInfo()
+	return s
+}
+
+// NewServerWithBackgroundIndexing creates a server that will be populated via background indexing.
+func NewServerWithBackgroundIndexing(projectPath, pythonVersion string, disableAnalytics bool) *Server {
+	tracker := NewStatusTracker()
+	// Starts in StateUninitialized
+
+	s := &Server{
+		projectPath:      projectPath,
+		pythonVersion:    pythonVersion,
+		callGraph:        nil, // Will be set later
+		moduleRegistry:   nil, // Will be set later
+		codeGraph:        nil, // Will be set later
+		statusTracker:    tracker,
+		degradation:      NewGracefulDegradation(tracker),
+		analytics:        NewAnalytics("stdio", disableAnalytics),
+		disableAnalytics: disableAnalytics,
+		reachReporter:    updatecheck.NewReachReporter(),
+	}
+	s.fetchUpdateInfo()
+	return s
+}
+
+// fetchUpdateInfo performs a single synchronous update-check fetch with a
+// 5-second ceiling. Failures are silently swallowed — s.updateInfo stays nil
+// and every downstream consumer handles nil gracefully.
+// No goroutine is spawned; this is the entire lifecycle for update-check state.
+func (s *Server) fetchUpdateInfo() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.updateInfo = updatecheck.Check(ctx, s.version, "mcp", updatecheck.Options{
+		HTTPTimeout: 5 * time.Second,
+		ManifestURL: mcpManifestURL,
+	})
+}
+
+// UpdateIndexingStatus updates the indexing progress.
+func (s *Server) UpdateIndexingStatus(state IndexingState, phase IndexingPhase, message string, progress float64) {
+	s.statusTracker.SetPhase(phase, message)
+}
+
+// SetIndexReady marks indexing as complete and updates with indexed data.
+func (s *Server) SetIndexReady(callGraph *core.CallGraph, moduleReg *core.ModuleRegistry,
+	codeGraph *graph.CodeGraph, buildTime time.Duration) {
+	s.callGraph = callGraph
+	s.moduleRegistry = moduleReg
+	s.codeGraph = codeGraph
+	s.buildTime = buildTime
+	s.indexedAt = time.Now()
+
+	stats := &IndexingStats{
+		Functions:     len(callGraph.Functions),
+		CallEdges:     len(callGraph.Edges),
+		Modules:       len(moduleReg.Modules),
+		Files:         len(moduleReg.FileToModule),
+		BuildDuration: buildTime,
+	}
+	s.statusTracker.CompleteIndexing(stats)
+	s.analytics.ReportIndexingComplete(stats)
+}
+
+// SetIndexingError marks indexing as failed.
+func (s *Server) SetIndexingError(err error) {
+	s.statusTracker.FailIndexing(err)
 }
 
 // SetTransport updates the analytics transport type (e.g., "http").
@@ -180,12 +285,42 @@ func (s *Server) handleInitialize(req *JSONRPCRequest) *JSONRPCResponse {
 		s.analytics.ReportClientConnected(params.ClientInfo.Name, params.ClientInfo.Version)
 	}
 
+	version := s.version
+	if version == "" {
+		version = "dev"
+	}
+
+	si := ServerInfo{
+		Name:    "dev.codepathfinder/pathfinder",
+		Version: version,
+	}
+
+	// Populate metadata from the update-check result (nil-safe).
+	if r := s.updateInfo; r != nil {
+		md := &ServerMetadata{}
+		if r.Upgrade != nil {
+			md.LatestVersion = r.Upgrade.Latest
+			md.UpdateMessage = r.Upgrade.Message
+			md.ReleaseURL = r.Upgrade.ReleaseURL
+		}
+		if r.Announcement != nil {
+			md.Announcement = &AnnouncementInfo{
+				ID:    r.Announcement.ID,
+				Level: r.Announcement.Level,
+				Title: r.Announcement.Title,
+				Text:  r.Announcement.Text,
+				URL:   r.Announcement.URL,
+			}
+		}
+		// Only set Metadata when at least one field is non-empty.
+		if *md != (ServerMetadata{}) {
+			si.Metadata = md
+		}
+	}
+
 	return SuccessResponse(req.ID, InitializeResult{
 		ProtocolVersion: "2024-11-05",
-		ServerInfo: ServerInfo{
-			Name:    "pathfinder",
-			Version: "0.1.0-poc",
-		},
+		ServerInfo:      si,
 		Capabilities: Capabilities{
 			Tools: &ToolsCapability{
 				ListChanged: false,
@@ -194,9 +329,20 @@ func (s *Server) handleInitialize(req *JSONRPCRequest) *JSONRPCResponse {
 	})
 }
 
-// handleToolsList returns the list of available tools.
+// handleToolsList returns the list of available tools, with the status tool
+// description enriched with an upgrade or announcement hint when available.
 func (s *Server) handleToolsList(req *JSONRPCRequest) *JSONRPCResponse {
 	tools := s.getToolDefinitions()
+	if s.updateInfo != nil {
+		for i := range tools {
+			if tools[i].Name == "status" {
+				tools[i].Description = formatStatusDescription(tools[i].Description, s.updateInfo)
+				break
+			}
+		}
+	}
+	// Fire reach analytics after description injection (once per 24-hour window).
+	s.reportReachIfNeeded()
 	return SuccessResponse(req.ID, ToolsListResult{
 		Tools: tools,
 	})
@@ -231,9 +377,35 @@ func (s *Server) handleToolsCall(req *JSONRPCRequest) *JSONRPCResponse {
 	})
 }
 
-// handleStatus returns the current indexing status.
+// handleStatus returns the current indexing status, enriched with any
+// available update-check fields.
 func (s *Server) handleStatus(req *JSONRPCRequest) *JSONRPCResponse {
-	return SuccessResponse(req.ID, s.degradation.GetStatusJSON())
+	result := s.degradation.GetStatusJSON()
+	s.injectUpdateInfo(result)
+	return SuccessResponse(req.ID, result)
+}
+
+// injectUpdateInfo merges update-check fields into a status map in-place.
+// It is a no-op when s.updateInfo is nil.
+func (s *Server) injectUpdateInfo(result map[string]any) {
+	r := s.updateInfo
+	if r == nil {
+		return
+	}
+	if r.Upgrade != nil {
+		result["latest_version"] = r.Upgrade.Latest  //nolint:tagliatelle
+		result["update_message"] = r.Upgrade.Message //nolint:tagliatelle
+		result["release_url"] = r.Upgrade.ReleaseURL //nolint:tagliatelle
+	}
+	if r.Announcement != nil {
+		result["announcement"] = map[string]any{
+			"id":    r.Announcement.ID,
+			"level": r.Announcement.Level,
+			"title": r.Announcement.Title,
+			"text":  r.Announcement.Text,
+			"url":   r.Announcement.URL,
+		}
+	}
 }
 
 // GetStatusTracker returns the status tracker for external use.

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/shivasurya/code-pathfinder/sast-engine/analytics"
@@ -13,6 +14,7 @@ import (
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/builder"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/registry"
+	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/resolution"
 	"github.com/shivasurya/code-pathfinder/sast-engine/output"
 	"github.com/spf13/cobra"
 )
@@ -68,6 +70,8 @@ Examples:
 		debug, _ := cmd.Flags().GetBool("debug")
 		failOnStr, _ := cmd.Flags().GetString("fail-on")
 		skipTests, _ := cmd.Flags().GetBool("skip-tests")
+		rawExcludes, _ := cmd.Flags().GetStringArray("exclude")
+		rawDisableRules, _ := cmd.Flags().GetStringArray("disable-rule")
 		baseRef, _ := cmd.Flags().GetString("base")
 		headRef, _ := cmd.Flags().GetString("head")
 		noDiff, _ := cmd.Flags().GetBool("no-diff")
@@ -81,7 +85,7 @@ Examples:
 		prOpts.Inline, _ = cmd.Flags().GetBool("pr-inline")
 
 		// Track CI started event (no PII, just metadata)
-		analytics.ReportEventWithProperties(analytics.CIStarted, map[string]interface{}{
+		analytics.ReportEventWithProperties(analytics.CIStarted, map[string]any{
 			"output_format":     outputFormat,
 			"skip_tests":        skipTests,
 			"has_local_rules":   rulesPath != "",
@@ -115,7 +119,7 @@ Examples:
 		}
 
 		if rulesPath == "" && len(rulesetSpecs) == 0 {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "validation",
 				"phase":      "initialization",
 			})
@@ -123,15 +127,25 @@ Examples:
 		}
 
 		if projectPath == "" {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "validation",
 				"phase":      "initialization",
 			})
 			return fmt.Errorf("--project flag is required")
 		}
 
+		excludes, err := validateExcludePatterns(rawExcludes)
+		if err != nil {
+			return err
+		}
+
+		disabledRules, err := validateDisableRules(rawDisableRules)
+		if err != nil {
+			return err
+		}
+
 		if outputFormat != "sarif" && outputFormat != "json" && outputFormat != "csv" {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "validation",
 				"phase":      "initialization",
 			})
@@ -157,7 +171,7 @@ Examples:
 		// Handle remote ruleset downloads and merge with local rules.
 		finalRulesPath, tempDir, err := prepareRules(rulesPath, rulesetSpecs, refreshRules, logger)
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "rule_preparation",
 				"phase":      "initialization",
 			})
@@ -209,10 +223,11 @@ Examples:
 			OnProgress: func() {
 				logger.UpdateProgress(1)
 			},
+			ExcludePatterns: excludes,
 		})
 		logger.FinishProgress()
 		if len(codeGraph.Nodes) == 0 {
-			logger.Progress("No source files found in project")
+			reportEmptyProject(logger, codeGraph.ProjectStats)
 		} else {
 			logger.Statistic("Code graph built: %d nodes", len(codeGraph.Nodes))
 		}
@@ -257,7 +272,7 @@ Examples:
 		cg, err := builder.BuildCallGraph(codeGraph, moduleRegistry, projectPath, logger)
 		logger.FinishProgress()
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "callgraph_build",
 				"phase":      "graph_building",
 			})
@@ -266,18 +281,80 @@ Examples:
 		logger.Statistic("Callgraph built: %d functions, %d call sites",
 			len(cg.Functions), countTotalCallSites(cg))
 
-		// Load Python DSL rules
+		// Build Go call graph if go.mod exists
+		goModPath := filepath.Join(projectPath, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			logger.Debug("Detected go.mod, building Go call graph...")
+
+			goRegistry, err := resolution.BuildGoModuleRegistry(projectPath)
+			if err != nil {
+				logger.Warning("Failed to build Go module registry: %v", err)
+			} else {
+				// Initialize Go stdlib loader and type inference engine
+				builder.InitGoStdlibLoader(goRegistry, projectPath, logger)
+				goTypeEngine := resolution.NewGoTypeInferenceEngine(goRegistry)
+
+				enableDBCache, _ := cmd.Flags().GetBool("enable-db-cache")
+				var analysisCache *builder.AnalysisCache
+				if enableDBCache {
+					var cacheErr error
+					analysisCache, cacheErr = builder.OpenAnalysisCache(projectPath)
+					if cacheErr != nil {
+						logger.Warning("Could not open analysis cache: %v — running full analysis", cacheErr)
+					} else {
+						defer analysisCache.Close()
+					}
+				}
+
+				goCG, err := builder.BuildGoCallGraph(codeGraph, goRegistry, goTypeEngine, logger, analysisCache)
+				if err != nil {
+					logger.Warning("Failed to build Go call graph: %v", err)
+				} else {
+					if analysisCache != nil {
+						logger.Progress("Cache: incremental analysis cache updated")
+					}
+					builder.MergeCallGraphs(cg, goCG)
+					logger.Statistic("Go call graph merged: %d functions, %d call sites",
+						len(goCG.Functions), countTotalCallSites(goCG))
+				}
+			}
+		}
+
+		// Load Python SDK rules
 		logger.StartProgress("Loading rules", -1)
 		rules, err := loader.LoadRules(logger)
 		logger.FinishProgress()
 		if err != nil {
-			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]interface{}{
+			analytics.ReportEventWithProperties(analytics.CIFailed, map[string]any{
 				"error_type": "rule_loading",
 				"phase":      "rule_loading",
 			})
 			return fmt.Errorf("failed to load rules: %w", err)
 		}
 		logger.Statistic("Loaded %d rules", len(rules))
+
+		// Apply --disable-rule. Mirrors --exclude: cheap up-front filter on the
+		// rule slice before any matcher work runs. Rule IDs are matched
+		// case-sensitively because the loader emits them verbatim.
+		if len(disabledRules) > 0 {
+			disabledSet := make(map[string]struct{}, len(disabledRules))
+			for _, id := range disabledRules {
+				disabledSet[id] = struct{}{}
+			}
+			kept := rules[:0]
+			skipped := 0
+			for _, r := range rules {
+				if _, drop := disabledSet[r.Rule.ID]; drop {
+					skipped++
+					continue
+				}
+				kept = append(kept, r)
+			}
+			rules = kept
+			if skipped > 0 {
+				logger.Statistic("Disabled %d rules via --disable-rule", skipped)
+			}
+		}
 
 		// Execute rules against callgraph
 		logger.Progress("Running security scan...")
@@ -318,30 +395,29 @@ Examples:
 		// Merge container detections with code analysis detections.
 		allEnriched = append(allEnriched, containerDetections...)
 
-		// Apply diff filter when diff-aware mode is active.
-		if diffEnabled && len(changedFiles) > 0 {
-			totalBefore := len(allEnriched)
-			diffFilter := output.NewDiffFilter(changedFiles)
-			allEnriched = diffFilter.Filter(allEnriched)
+		// Apply diff filter when diff-aware mode is active. See
+		// applyDiffFilter for the explicit "do not fall back to full scan
+		// on empty diff" contract this commit enforces.
+		totalBefore := len(allEnriched)
+		var filterApplied bool
+		allEnriched, filterApplied = applyDiffFilter(allEnriched, changedFiles, diffEnabled)
+		if filterApplied {
 			logger.Progress("Diff filter: %d/%d findings in changed files", len(allEnriched), totalBefore)
 		}
 
 		// Total rules = code analysis rules loaded + container rules loaded.
 		totalRules := len(rules) + containerRulesCount
 
-		// Count unique source files. When diff-aware, only count changed files.
-		var filesScanned int
-		if diffEnabled && len(changedFiles) > 0 {
-			filesScanned = len(changedFiles)
-		} else {
-			uniqueFiles := make(map[string]bool)
-			for _, node := range codeGraph.Nodes {
-				if node.File != "" {
-					uniqueFiles[node.File] = true
-				}
+		// Count unique source files for the report. countScannedFiles picks
+		// len(changedFiles) when diff-aware (including 0, by design), else
+		// the unique-file count derived from the code graph.
+		uniqueFiles := make(map[string]bool)
+		for _, node := range codeGraph.Nodes {
+			if node.File != "" {
+				uniqueFiles[node.File] = true
 			}
-			filesScanned = len(uniqueFiles)
 		}
+		filesScanned := countScannedFiles(diffEnabled, len(changedFiles), len(uniqueFiles))
 
 		logger.Statistic("Scan complete. Found %d vulnerabilities", len(allEnriched))
 		logger.Progress("Generating %s output...", outputFormat)
@@ -435,19 +511,19 @@ Examples:
 			severityBreakdown[det.Rule.Severity]++
 		}
 
-		analytics.ReportEventWithProperties(analytics.CICompleted, map[string]interface{}{
-			"duration_ms":         time.Since(startTime).Milliseconds(),
-			"rules_count":         totalRules,
-			"findings_count":      len(allEnriched),
-			"diff_aware":          diffEnabled,
-			"diff_changed_files":  len(changedFiles),
-			"severity_critical": severityBreakdown["critical"],
-			"severity_high":     severityBreakdown["high"],
-			"severity_medium":   severityBreakdown["medium"],
-			"severity_low":      severityBreakdown["low"],
-			"output_format":     outputFormat,
-			"exit_code":         int(exitCode),
-			"had_errors":        hadErrors,
+		analytics.ReportEventWithProperties(analytics.CICompleted, map[string]any{
+			"duration_ms":        time.Since(startTime).Milliseconds(),
+			"rules_count":        totalRules,
+			"findings_count":     len(allEnriched),
+			"diff_aware":         diffEnabled,
+			"diff_changed_files": len(changedFiles),
+			"severity_critical":  severityBreakdown["critical"],
+			"severity_high":      severityBreakdown["high"],
+			"severity_medium":    severityBreakdown["medium"],
+			"severity_low":       severityBreakdown["low"],
+			"output_format":      outputFormat,
+			"exit_code":          int(exitCode),
+			"had_errors":         hadErrors,
 		})
 
 		if exitCode != output.ExitCodeSuccess {
@@ -458,14 +534,12 @@ Examples:
 	},
 }
 
-
-
 // Variable to allow mocking os.Exit in tests.
 var osExit = os.Exit
 
 func init() {
 	rootCmd.AddCommand(ciCmd)
-	ciCmd.Flags().StringP("rules", "r", "", "Path to Python DSL rules file or directory")
+	ciCmd.Flags().StringP("rules", "r", "", "Path to Python SDK rules file or directory")
 	ciCmd.Flags().StringArray("ruleset", []string{}, "Ruleset bundle (e.g., docker/security) or individual rule ID (e.g., docker/DOCKER-BP-007). Can be specified multiple times.")
 	ciCmd.Flags().Bool("refresh-rules", false, "Force refresh of cached rulesets")
 	ciCmd.Flags().StringP("project", "p", "", "Path to project directory to scan (required)")
@@ -475,6 +549,8 @@ func init() {
 	ciCmd.Flags().Bool("debug", false, "Show detailed debug diagnostics with file-level progress and timestamps")
 	ciCmd.Flags().String("fail-on", "", "Fail with exit code 1 if findings match severities (e.g., critical,high)")
 	ciCmd.Flags().Bool("skip-tests", true, "Skip test files (test_*.py, *_test.py, conftest.py, etc.)")
+	ciCmd.Flags().StringArray("exclude", nil, "Exclude files or directories from the scan. Repo-relative path prefix; repeatable. e.g. --exclude rules/ --exclude sast-engine/test-fixtures")
+	ciCmd.Flags().StringArray("disable-rule", nil, "Disable a rule by ID; repeatable. e.g. --disable-rule SAST-CMD-001 --disable-rule GO-SSRF-001. IDs must match [A-Za-z0-9_-]{1,64}.")
 	ciCmd.Flags().String("base", "", "Base git ref for diff-aware scanning (auto-detected in CI)")
 	ciCmd.Flags().String("head", "HEAD", "Head git ref for diff-aware scanning")
 	ciCmd.Flags().Bool("no-diff", false, "Disable diff-aware scanning (scan all files)")
@@ -483,5 +559,6 @@ func init() {
 	ciCmd.Flags().Int("github-pr", 0, "Pull request number for posting comments")
 	ciCmd.Flags().Bool("pr-comment", false, "Post summary comment on the pull request")
 	ciCmd.Flags().Bool("pr-inline", false, "Post inline review comments for critical/high findings")
+	ciCmd.Flags().Bool("enable-db-cache", false, "Enable SQLite-backed incremental analysis cache (experimental)")
 	ciCmd.MarkFlagRequired("project")
 }

@@ -31,10 +31,10 @@ type Node struct {
 	DataType             string
 	Scope                string
 	VariableValue        string
-	hasAccess            bool
 	File                 string
 	isJavaSourceFile     bool
 	isPythonSourceFile   bool
+	isGoSourceFile       bool
 	ThrowsExceptions     []string
 	Annotation           []string
 	JavaDoc              *model.Javadoc
@@ -50,6 +50,8 @@ type Node struct {
 	AssertStmt           *model.AssertStmt
 	ReturnStmt           *model.ReturnStmt
 	BlockStmt            *model.BlockStmt
+	Language             string         // "go", "python", "java" - set during parsing
+	Metadata             map[string]any // Generic key-value store for language/tool-specific metadata
 }
 
 // GetCodeSnippet returns the code snippet for this node.
@@ -82,4 +84,8 @@ type Edge struct {
 type CodeGraph struct {
 	Nodes map[string]*Node
 	Edges []*Edge
+	// ProjectStats summarises what the file walk saw. Set by Initialize.
+	// Callers read it to render meaningful empty-state messages when
+	// len(Nodes) == 0 (e.g. "Detected: TypeScript (32), JavaScript (8)").
+	ProjectStats ProjectStats
 }

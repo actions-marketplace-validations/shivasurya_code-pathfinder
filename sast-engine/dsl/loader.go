@@ -8,22 +8,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/shivasurya/code-pathfinder/sast-engine/graph/callgraph/core"
 )
 
 // Logger interface for verbose logging (avoids import cycle with output package).
 type Logger interface {
-	Debug(format string, args ...interface{})
-	Statistic(format string, args ...interface{})
+	Debug(format string, args ...any)
+	Statistic(format string, args ...any)
 	IsDebug() bool
 	IsVerbose() bool
 }
 
-// RuleLoader loads Python DSL rules and executes them.
+// RuleLoader loads Python SDK rules and executes them.
 type RuleLoader struct {
-	RulesPath string // Path to .py rules file or directory
+	RulesPath   string               // Path to .py rules file or directory
+	Config      *QueryTypeConfig     // Execution config (nil → defaults)
+	Diagnostics *DiagnosticCollector  // Optional diagnostic collector (nil → no diagnostics)
 }
 
 // NewRuleLoader creates a new rule loader.
@@ -31,7 +32,7 @@ func NewRuleLoader(rulesPath string) *RuleLoader {
 	return &RuleLoader{RulesPath: rulesPath}
 }
 
-// LoadRules loads and executes Python DSL rules.
+// LoadRules loads and executes Python SDK rules.
 //
 // Algorithm:
 //  1. Check if path is file or directory
@@ -64,7 +65,8 @@ func (l *RuleLoader) LoadRules(logger Logger) ([]RuleIR, error) {
 // loadRulesFromFile loads rules from a single Python file.
 func (l *RuleLoader) loadRulesFromFile(filePath string, logger Logger) ([]RuleIR, error) {
 	// Create context with timeout to prevent hanging
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := l.Config.getExecutionTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "python3", filePath)
@@ -73,7 +75,7 @@ func (l *RuleLoader) loadRulesFromFile(filePath string, logger Logger) ([]RuleIR
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("Python rule execution timed out after 30s for file: %s", filePath)
+			return nil, fmt.Errorf("Python rule execution timed out after %s for file: %s", timeout, filePath)
 		}
 		return nil, fmt.Errorf("failed to execute Python rules from %s: %w", filePath, err)
 	}
@@ -83,8 +85,8 @@ func (l *RuleLoader) loadRulesFromFile(filePath string, logger Logger) ([]RuleIR
 	if err := json.Unmarshal(output, &rules); err != nil {
 		// If array parsing fails, check if it's a container rule (object format)
 		var containerTest struct {
-			Dockerfile []interface{} `json:"dockerfile"`
-			Compose    []interface{} `json:"compose"`
+			Dockerfile []any `json:"dockerfile"`
+			Compose    []any `json:"compose"`
 		}
 		if containerErr := json.Unmarshal(output, &containerTest); containerErr == nil {
 			// This is a container rule file, skip it (handled by LoadContainerRules)
@@ -126,7 +128,10 @@ func (l *RuleLoader) loadRulesFromDirectory(dirPath string, logger Logger) ([]Ru
 		// Load rules from this file
 		rules, err := l.loadRulesFromFile(path, logger)
 		if err != nil {
-			// Silently skip files that fail to load (may be container rules)
+			// Log the error for debugging, then skip (may be container rules)
+			if logger != nil {
+				logger.Debug("skipping rule file %s: %v", path, err)
+			}
 			//nolint:nilerr // Intentionally skip files that aren't code analysis rules
 			return nil
 		}
@@ -152,8 +157,14 @@ func hasCodeAnalysisRuleDecorators(filePath string) bool {
 	}
 
 	fileContent := string(content)
-	// Check for rule decorator or codepathfinder imports
+	// NOTE: This string-based decorator detection is fragile — it could match
+	// @rule( inside comments or string literals. A proper AST-based parser
+	// is tracked as a separate tech spec. For now, this works for standard
+	// rule files where @rule appears at the top level.
 	return strings.Contains(fileContent, "@rule(") ||
+		strings.Contains(fileContent, "@go_rule(") ||
+		strings.Contains(fileContent, "@c_rule(") ||
+		strings.Contains(fileContent, "@cpp_rule(") ||
 		strings.Contains(fileContent, "from codepathfinder import") ||
 		strings.Contains(fileContent, "import codepathfinder")
 }
@@ -204,7 +215,7 @@ func (l *RuleLoader) hasAnyContainerRulesInPath() bool {
 	return hasRules
 }
 
-// LoadContainerRules loads container rules (Dockerfile/Compose) from Python DSL files.
+// LoadContainerRules loads container rules (Dockerfile/Compose) from Python SDK files.
 // Returns JSON IR in format: {"dockerfile": [...], "compose": [...]}.
 func (l *RuleLoader) LoadContainerRules(logger Logger) ([]byte, error) {
 	// Check if path is file or directory (check existence first)
@@ -219,8 +230,8 @@ func (l *RuleLoader) LoadContainerRules(logger Logger) ([]byte, error) {
 	}
 
 	var containerRulesJSON struct {
-		Dockerfile []map[string]interface{} `json:"dockerfile"`
-		Compose    []map[string]interface{} `json:"compose"`
+		Dockerfile []map[string]any `json:"dockerfile"`
+		Compose    []map[string]any `json:"compose"`
 	}
 
 	// If single file, load directly
@@ -231,8 +242,8 @@ func (l *RuleLoader) LoadContainerRules(logger Logger) ([]byte, error) {
 		}
 		// Parse and merge
 		var fileRules struct {
-			Dockerfile []map[string]interface{} `json:"dockerfile"`
-			Compose    []map[string]interface{} `json:"compose"`
+			Dockerfile []map[string]any `json:"dockerfile"`
+			Compose    []map[string]any `json:"compose"`
 		}
 		if err := json.Unmarshal(jsonIR, &fileRules); err != nil {
 			return nil, fmt.Errorf("failed to parse container rules JSON: %w", err)
@@ -266,8 +277,8 @@ func (l *RuleLoader) LoadContainerRules(logger Logger) ([]byte, error) {
 
 			// Parse and merge
 			var fileRules struct {
-				Dockerfile []map[string]interface{} `json:"dockerfile"`
-				Compose    []map[string]interface{} `json:"compose"`
+				Dockerfile []map[string]any `json:"dockerfile"`
+				Compose    []map[string]any `json:"compose"`
 			}
 			if err := json.Unmarshal(jsonIR, &fileRules); err != nil {
 				// Skip files with invalid JSON (might not be container rules)
@@ -295,7 +306,8 @@ func (l *RuleLoader) LoadContainerRules(logger Logger) ([]byte, error) {
 // Creates a temporary Python script to import and compile all rules, then executes it.
 func (l *RuleLoader) loadContainerRulesFromFile(rulesPath string, logger Logger) ([]byte, error) {
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := l.Config.getExecutionTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Create a temporary Python script that compiles rules from the given path
@@ -338,15 +350,15 @@ print(json.dumps(json_ir))
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("Python rule execution timed out after 30s")
+			return nil, fmt.Errorf("Python rule execution timed out after %s", timeout)
 		}
 		return nil, fmt.Errorf("failed to compile container rules: %w", err)
 	}
 
 	// Validate it's valid JSON and log loaded rules in verbose mode
 	var containerRules struct {
-		Dockerfile []map[string]interface{} `json:"dockerfile"`
-		Compose    []map[string]interface{} `json:"compose"`
+		Dockerfile []map[string]any `json:"dockerfile"`
+		Compose    []map[string]any `json:"compose"`
 	}
 	if err := json.Unmarshal(output, &containerRules); err != nil {
 		return nil, fmt.Errorf("invalid JSON output from container rules: %w", err)
@@ -372,7 +384,7 @@ print(json.dumps(json_ir))
 // ExecuteRule executes a single rule against callgraph.
 func (l *RuleLoader) ExecuteRule(rule *RuleIR, cg *core.CallGraph) ([]DataflowDetection, error) {
 	// Determine matcher type and execute
-	matcherMap, ok := rule.Matcher.(map[string]interface{})
+	matcherMap, ok := rule.Matcher.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("matcher is not a map")
 	}
@@ -395,6 +407,12 @@ func (l *RuleLoader) ExecuteRule(rule *RuleIR, cg *core.CallGraph) ([]DataflowDe
 	case "logic_and", "logic_or", "logic_not":
 		return l.executeLogic(matcherType, matcherMap, cg)
 
+	case "type_constrained_call":
+		return l.executeTypeConstrainedCall(matcherMap, cg)
+
+	case "type_constrained_attribute":
+		return l.executeTypeConstrainedAttribute(matcherMap, cg)
+
 	// Container matchers - skip silently (handled by ContainerRuleExecutor)
 	case "missing_instruction", "instruction", "service_has", "service_missing", "any_of", "all_of", "none_of":
 		return []DataflowDetection{}, nil
@@ -404,7 +422,7 @@ func (l *RuleLoader) ExecuteRule(rule *RuleIR, cg *core.CallGraph) ([]DataflowDe
 	}
 }
 
-func (l *RuleLoader) executeCallMatcher(matcherMap map[string]interface{}, cg *core.CallGraph) ([]DataflowDetection, error) {
+func (l *RuleLoader) executeCallMatcher(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
 	// Convert map to CallMatcherIR
 	jsonBytes, err := json.Marshal(matcherMap)
 	if err != nil {
@@ -423,20 +441,22 @@ func (l *RuleLoader) executeCallMatcher(matcherMap map[string]interface{}, cg *c
 	detections := []DataflowDetection{}
 	for _, match := range matches {
 		detections = append(detections, DataflowDetection{
-			FunctionFQN: match.FunctionFQN,
-			SourceLine:  match.Line,
-			SinkLine:    match.Line,
-			SinkCall:    match.CallSite.Target,
-			Confidence:  1.0,
-			Scope:       "local",
+			FunctionFQN:  match.FunctionFQN,
+			SourceLine:   match.Line,
+			SourceColumn: match.CallSite.Location.Column,
+			SinkLine:     match.Line,
+			SinkColumn:   match.CallSite.Location.Column,
+			SinkCall:     match.CallSite.Target,
+			Confidence:   1.0,
+			Scope:        "local",
 		})
 	}
 
 	return detections, nil
 }
 
-func (l *RuleLoader) executeDataflow(matcherMap map[string]interface{}, cg *core.CallGraph) ([]DataflowDetection, error) {
-	// Convert map to DataflowIR
+func (l *RuleLoader) executeDataflow(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	// Convert map to DataflowIR.
 	jsonBytes, err := json.Marshal(matcherMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal dataflow: %w", err)
@@ -447,11 +467,18 @@ func (l *RuleLoader) executeDataflow(matcherMap map[string]interface{}, cg *core
 		return nil, fmt.Errorf("failed to unmarshal dataflow: %w", err)
 	}
 
+	if err := validateDataflowIR(&ir, l.Diagnostics); err != nil {
+		l.Diagnostics.Addf("skip", "ir_validation", "skipping dataflow: %v", err)
+		return []DataflowDetection{}, nil
+	}
+
 	executor := NewDataflowExecutor(&ir, cg)
-	return executor.Execute(), nil
+	executor.Config = l.Config
+	executor.Diagnostics = l.Diagnostics
+	return safeExecute(executor.Execute, l.Diagnostics), nil
 }
 
-func (l *RuleLoader) executeVariableMatcher(matcherMap map[string]interface{}, cg *core.CallGraph) ([]DataflowDetection, error) {
+func (l *RuleLoader) executeVariableMatcher(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
 	// Convert map to VariableMatcherIR
 	jsonBytes, err := json.Marshal(matcherMap)
 	if err != nil {
@@ -482,10 +509,300 @@ func (l *RuleLoader) executeVariableMatcher(matcherMap map[string]interface{}, c
 	return detections, nil
 }
 
-//nolint:unparam // Will be implemented in future PRs
-func (l *RuleLoader) executeLogic(logicType string, matcherMap map[string]interface{}, cg *core.CallGraph) ([]DataflowDetection, error) {
-	// TODO: Handle And/Or/Not logic operators
-	// This requires recursive execution of nested matchers
-	// For now, return empty detections as placeholder
-	return []DataflowDetection{}, nil
+func (l *RuleLoader) executeTypeConstrainedCall(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	jsonBytes, err := json.Marshal(matcherMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal type_constrained_call: %w", err)
+	}
+
+	var ir TypeConstrainedCallIR
+	if err := json.Unmarshal(jsonBytes, &ir); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal type_constrained_call: %w", err)
+	}
+
+	if err := validateTypeConstrainedCallIR(&ir, l.Diagnostics); err != nil {
+		l.Diagnostics.Addf("skip", "ir_validation", "skipping type_constrained_call: %v", err)
+		return []DataflowDetection{}, nil
+	}
+
+	executor := &TypeConstrainedCallExecutor{
+		IR:               &ir,
+		CallGraph:        cg,
+		Config:           l.Config,
+		ThirdPartyRemote: extractInheritanceChecker(cg),
+		Diagnostics:      l.Diagnostics,
+	}
+	return safeExecute(executor.Execute, l.Diagnostics), nil
+}
+
+func (l *RuleLoader) executeTypeConstrainedAttribute(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	jsonBytes, err := json.Marshal(matcherMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal type_constrained_attribute: %w", err)
+	}
+
+	var ir TypeConstrainedAttributeIR
+	if err := json.Unmarshal(jsonBytes, &ir); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal type_constrained_attribute: %w", err)
+	}
+
+	if err := validateTypeConstrainedAttributeIR(&ir, l.Diagnostics); err != nil {
+		l.Diagnostics.Addf("skip", "ir_validation", "skipping type_constrained_attribute: %v", err)
+		return []DataflowDetection{}, nil
+	}
+
+	executor := &TypeConstrainedAttributeExecutor{
+		IR:               &ir,
+		CallGraph:        cg,
+		Config:           l.Config,
+		ThirdPartyRemote: extractInheritanceChecker(cg),
+		Diagnostics:      l.Diagnostics,
+	}
+	return safeExecute(executor.Execute, l.Diagnostics), nil
+}
+
+func (l *RuleLoader) executeLogic(logicType string, matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	switch logicType {
+	case "logic_or":
+		return l.executeLogicOr(matcherMap, cg)
+	case "logic_and":
+		return l.executeLogicAnd(matcherMap, cg)
+	case "logic_not":
+		return l.executeLogicNot(matcherMap, cg)
+	default:
+		return nil, fmt.Errorf("unknown logic type: %s", logicType)
+	}
+}
+
+func (l *RuleLoader) executeLogicOr(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	matchers, ok := matcherMap["matchers"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("logic_or requires 'matchers' array")
+	}
+
+	var all []DataflowDetection
+	for _, m := range matchers {
+		mMap, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		ruleIR := &RuleIR{Matcher: mMap}
+		dets, err := l.ExecuteRule(ruleIR, cg)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, dets...)
+	}
+	return deduplicateDetections(all), nil
+}
+
+func (l *RuleLoader) executeLogicAnd(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	matchers, ok := matcherMap["matchers"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("logic_and requires 'matchers' array")
+	}
+
+	if len(matchers) == 0 {
+		return nil, nil
+	}
+
+	// Execute first matcher
+	mMap, ok := matchers[0].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("matcher is not a map")
+	}
+	ruleIR := &RuleIR{Matcher: mMap}
+	result, err := l.ExecuteRule(ruleIR, cg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Intersect with remaining matchers
+	for _, m := range matchers[1:] {
+		mMap, ok = m.(map[string]any)
+		if !ok {
+			continue
+		}
+		ruleIR = &RuleIR{Matcher: mMap}
+		dets, err := l.ExecuteRule(ruleIR, cg)
+		if err != nil {
+			return nil, err
+		}
+		result = intersectDetections(result, dets)
+	}
+	return result, nil
+}
+
+// executeLogicNot implements Not(M1, M2, ...) semantics:
+// Universe = all call sites in CallGraph, Result = Universe - Union(M1, M2, ...).
+func (l *RuleLoader) executeLogicNot(matcherMap map[string]any, cg *core.CallGraph) ([]DataflowDetection, error) {
+	if cg == nil || cg.CallSites == nil {
+		l.Diagnostics.Addf("warning", "logic_not", "CallGraph or CallSites is nil, returning empty")
+		return nil, nil
+	}
+
+	// Build universe: all (functionFQN, line) pairs from call graph.
+	type csKey struct {
+		FunctionFQN string
+		Line        int
+		Target      string
+	}
+	universe := make(map[csKey]bool)
+	var universeKeys []csKey
+	for funcFQN, callSites := range cg.CallSites {
+		for _, cs := range callSites {
+			key := csKey{funcFQN, cs.Location.Line, cs.Target}
+			if !universe[key] {
+				universe[key] = true
+				universeKeys = append(universeKeys, key)
+			}
+		}
+	}
+
+	// Execute nested matchers, collect matched keys.
+	matchers, ok := matcherMap["matchers"].([]any)
+	if !ok {
+		// No matchers array → return entire universe.
+		l.Diagnostics.Addf("warning", "logic_not", "no 'matchers' array, returning entire universe (%d call sites)", len(universeKeys))
+	}
+
+	matched := make(map[csKey]bool)
+	for _, m := range matchers {
+		mMap, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		ruleIR := &RuleIR{Matcher: mMap}
+		dets, err := l.ExecuteRule(ruleIR, cg)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range dets {
+			matched[csKey{d.FunctionFQN, d.SourceLine, d.SinkCall}] = true
+		}
+	}
+
+	// Subtract: universe - matched.
+	var result []DataflowDetection
+	for _, key := range universeKeys {
+		if !matched[key] {
+			result = append(result, DataflowDetection{
+				FunctionFQN: key.FunctionFQN,
+				SourceLine:  key.Line,
+				SinkLine:    key.Line,
+				SinkCall:    key.Target,
+				Confidence:  1.0,
+				MatchMethod: "logic_not",
+				Scope:       "local",
+			})
+		}
+	}
+
+	l.Diagnostics.Addf("debug", "logic_not",
+		"universe=%d, matched=%d, result=%d", len(universe), len(matched), len(result))
+
+	return result, nil
+}
+
+// extractInheritanceChecker extracts InheritanceCheckers from a CallGraph's
+// ThirdPartyRemote and StdlibRemote fields, returning a composite checker
+// that queries both registries. Returns nil if neither is set.
+func extractInheritanceChecker(cg *core.CallGraph) InheritanceChecker {
+	if cg == nil {
+		return nil
+	}
+
+	var checkers []InheritanceChecker
+
+	if cg.ThirdPartyRemote != nil {
+		if checker, ok := cg.ThirdPartyRemote.(InheritanceChecker); ok {
+			checkers = append(checkers, checker)
+		}
+	}
+	if cg.StdlibRemote != nil {
+		if checker, ok := cg.StdlibRemote.(InheritanceChecker); ok {
+			checkers = append(checkers, checker)
+		}
+	}
+
+	switch len(checkers) {
+	case 0:
+		return nil
+	case 1:
+		return checkers[0]
+	default:
+		return &compositeInheritanceChecker{checkers: checkers}
+	}
+}
+
+// compositeInheritanceChecker delegates to multiple InheritanceChecker instances,
+// checking each in order until one matches (third-party, then stdlib).
+type compositeInheritanceChecker struct {
+	checkers []InheritanceChecker
+}
+
+func (c *compositeInheritanceChecker) HasModule(moduleName string) bool {
+	for _, ch := range c.checkers {
+		if ch.HasModule(moduleName) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *compositeInheritanceChecker) IsSubclassSimple(moduleName, className, parentFQN string) bool {
+	for _, ch := range c.checkers {
+		if ch.HasModule(moduleName) && ch.IsSubclassSimple(moduleName, className, parentFQN) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *compositeInheritanceChecker) GetClassMRO(moduleName, className string) []string {
+	for _, ch := range c.checkers {
+		if mro := ch.GetClassMRO(moduleName, className); len(mro) > 0 {
+			return mro
+		}
+	}
+	return nil
+}
+
+func dedupKey(d DataflowDetection) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d:%s:%s",
+		d.FunctionFQN, d.SourceLine, d.SourceColumn, d.SinkLine, d.SinkColumn, d.SinkCall, d.MatchMethod)
+}
+
+func deduplicateDetections(dets []DataflowDetection) []DataflowDetection {
+	best := make(map[string]DataflowDetection)
+	for _, d := range dets {
+		key := dedupKey(d)
+		if existing, ok := best[key]; !ok || d.Confidence > existing.Confidence {
+			best[key] = d
+		}
+	}
+	result := make([]DataflowDetection, 0, len(best))
+	for _, d := range best {
+		result = append(result, d)
+	}
+	return result
+}
+
+func intersectKey(d DataflowDetection) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d",
+		d.FunctionFQN, d.SourceLine, d.SourceColumn, d.SinkLine, d.SinkColumn)
+}
+
+func intersectDetections(a, b []DataflowDetection) []DataflowDetection {
+	bSet := make(map[string]bool)
+	for _, d := range b {
+		bSet[intersectKey(d)] = true
+	}
+	var result []DataflowDetection
+	for _, d := range a {
+		if bSet[intersectKey(d)] {
+			result = append(result, d)
+		}
+	}
+	return result
 }
